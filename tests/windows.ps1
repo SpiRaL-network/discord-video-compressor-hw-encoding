@@ -27,6 +27,7 @@ function Run-Compression {
     & $powershell @arguments 2>&1 | ForEach-Object { "$_" } | Out-File -LiteralPath $stdout -Encoding UTF8
     $code=$LASTEXITCODE
     $ErrorActionPreference='Stop'
+    if ($code -ne $ExpectedExit) { Get-Content -LiteralPath $stdout -Tail 50 | ForEach-Object { Write-Host $_ } }
     Assert ($code -eq $ExpectedExit) "Unexpected exit $code for $Name. See $stdout"
     if ($ExpectedExit -eq 0) {
         $outputs=@(Get-ChildItem -LiteralPath $settings.output_dir -Filter '*_optimized.mp4')

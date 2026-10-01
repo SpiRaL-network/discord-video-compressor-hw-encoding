@@ -5,6 +5,7 @@ artifacts=${1:-"$root/test-artifacts-linux"}
 mkdir -p "$artifacts"
 artifacts=$(cd "$artifacts" && pwd)
 cd "$artifacts"
+trap 'for log in *.log; do echo "--- $log"; tail -n 30 "$log"; done' ERR
 ffmpeg -hide_banner -loglevel error -f lavfi -i testsrc2=size=640x360:rate=30:duration=12 -f lavfi -i sine=frequency=400:duration=12 -c:v libx264 -preset ultrafast -crf 16 -g 30 -c:a aac -shortest -y 'clip [one] ! &.mp4'
 run() { bash "$root/shrinkwrap.sh" "$@"; }
 check_cap() {
