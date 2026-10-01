@@ -135,7 +135,7 @@ try {
 } finally { Close-CompressorWorker $run }
 # Inject a runtime GPU failure, then verify the retry produces an actual software video.
 $ast=[Management.Automation.Language.Parser]::ParseFile((Join-Path $root 'shrinkwrap.ps1'),[ref]$tokens,[ref]$errors)
-$needed=@('Get-PresetInfo','Get-HwPreset','Test-PresetNative','Resolve-PresetToken','Test-EncoderAvailable','Get-SoftwareEncoder','Invoke-FFmpegEncode')
+$needed=@('Write-ColorOutput','Get-PresetInfo','Get-HwPreset','Test-PresetNative','Resolve-PresetToken','Test-EncoderAvailable','Get-SoftwareEncoder','Invoke-FFmpegEncode')
 foreach ($node in $ast.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] },$false)) {
     if ($node.Name -in $needed) { . ([scriptblock]::Create($node.Extent.Text)) }
 }
@@ -144,7 +144,9 @@ $Script:FFmpeg=$ffmpeg; $Script:SoftwareOrder=@('libx264'); $Script:CodecFamily=
 $Script:VideoCodec='h264_nvenc'; $Script:Preset='p3'; $Script:VsyncFlag='-fps_mode cfr'
 $Script:OUTPUT_DIR=$Artifacts; $Script:AudioChannels=2; $NoAudio=$false
 $retry=Join-Path $Artifacts 'runtime-fallback.mp4'
+$ErrorActionPreference='Continue'
 $result=Invoke-FFmpegEncode -InputFile $clip -OutputFile $retry -VideoParams @{Bitrate=700;Preset='p3'} -AudioParams @{Bitrate=96} -PassLogFile (Join-Path $Artifacts 'runtime-pass') -Pass 2
+$ErrorActionPreference='Stop'
 Assert ($result -eq 0 -and $Script:CodecFamily -eq 'software') 'Runtime GPU fallback did not succeed.'
 $info=Probe $retry
 Assert (@($info.streams | Where-Object codec_type -eq 'video')[0].codec_name -eq 'h264') 'Runtime fallback did not produce H.264.'
