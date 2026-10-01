@@ -17,3 +17,7 @@ ffmpeg-temp/
 .DS_Store
 Thumbs.db
 *.txt
+*.log
+ffmpeg-*.zip
+ffmpeg-temp-*/
+test-artifacts*/

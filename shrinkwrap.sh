@@ -1,5 +1,9 @@
 #!/bin/bash
 
+if [ "${BASH_VERSINFO[0]}" -lt 4 ]; then
+    echo "Bash 4+ is required. On macOS: brew install bash, then run bash shrinkwrap.sh." >&2
+    exit 1
+fi
 export LC_ALL=C
 
 # NOTE: 'set -e' is intentionally NOT enabled. The pipeline relies on explicit
@@ -11,12 +15,9 @@ set -o pipefail # Capture errors even inside pipes
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)
 [ -z "$SCRIPT_DIR" ] && SCRIPT_DIR="."
 
-# Built-in defaults (used when shrinkwrap.conf is absent or a key is missing). The hardware
-# order is AV1-hw -> HEVC-hw; h264_* is intentionally absent (reachable only by explicit
-# selection, never auto-ranked above libx265). Config's hardware_order/software_order override
-# these; mode defaults to software so a config-less run behaves exactly like before.
-DEFAULT_MODE="software"
-DEFAULT_HARDWARE_ORDER="av1_amf av1_nvenc av1_qsv hevc_amf hevc_nvenc hevc_qsv hevc_videotoolbox"
+# Hardware-first defaults. Configuration can override codec priority and selection mode.
+DEFAULT_MODE="hardware"
+DEFAULT_HARDWARE_ORDER="av1_amf av1_nvenc av1_qsv hevc_amf hevc_nvenc hevc_qsv hevc_videotoolbox h264_nvenc h264_amf h264_qsv h264_videotoolbox"
 DEFAULT_SOFTWARE_ORDER="libx265 libx264"
 
 # --- Persisted preferences (shrinkwrap.conf) ----------------------------------
@@ -119,7 +120,7 @@ write_config() { # <mode> : write conf (preserving existing settings); echo path
     local body
     body="# discord-video-compressor preferences.
 # Regenerate:  ./shrinkwrap.sh --config   |   .\\shrinkwrap.ps1 -Config     (or edit by hand)
-# Delete this file to return to defaults (software x265, 19.8MB target).
+# Delete this file to return to defaults (automatic hardware, 19.8 decimal MB target).
 #
 # mode: drives encoder choice when no -c/-Encoder flag is given.
 #   hardware       - walk hardware_order (GPU); fall back to software_order
@@ -182,15 +183,16 @@ run_config_wizard() { # interactive: prompt for a default encoder, write conf, e
     echo "  [1] Hardware (GPU)    Fast, offloads to GPU. Usually a bit larger / lower-quality at the"
     echo "                        size cap; hardware AV1/HEVC may not play inline on Discord for"
     echo "                        everyone. Falls back to software if no GPU encoder works."
-    echo "  [2] Software x265     (Recommended) Best quality at the cap (libx265 2-pass); plays"
+    echo "  [2] Software x265     Best quality at the cap (libx265 2-pass); plays"
     echo "                        inline on Discord. Slower. Falls back to x264."
     echo "  [3] Software x264     Maximum compatibility / legacy. Plays everywhere, larger files."
-    printf "Your choice [2]: "
+    printf "Your choice [1]: "
     read -r answer
     case "$answer" in
         1) new_mode="hardware" ;;
         3) new_mode="software_x264" ;;
-        *) new_mode="software" ;;                      # empty Enter / anything else -> default
+        2) new_mode="software" ;;
+        *) new_mode="hardware" ;;                      # empty Enter / anything else -> default
     esac
     if saved=$(write_config "$new_mode"); then
         echo "Saved to $saved."
@@ -204,7 +206,7 @@ run_config_wizard() { # interactive: prompt for a default encoder, write conf, e
 usage() {
     echo "Usage: $0 [options] [files...]"
     echo "Options:"
-    echo "  -c <encoder>    Encoder: auto (default, software 2-pass), hw (probe GPU"
+    echo "  -c <encoder>    Encoder: auto/hw (default, probe GPU"
     echo "                  hierarchy), or a specific encoder (e.g. hevc_nvenc, av1_amf,"
     echo "                  h264_qsv) - functionally validated, falls back to software"
     echo "  -p <preset>     FFmpeg x265 preset (default: slow)"
@@ -244,7 +246,7 @@ HARDWARE_ORDER="${CONFIG_HARDWARE_ORDER:-$DEFAULT_HARDWARE_ORDER}"
 SOFTWARE_ORDER="${CONFIG_SOFTWARE_ORDER:-$DEFAULT_SOFTWARE_ORDER}"
 
 preset="${CONFIG_PRESET:-slow}"
-encoder_choice="auto" # auto = software 2-pass (default); hw = probe GPU; or an encoder name
+encoder_choice="auto" # auto/hw = probe GPU; software = two-pass CPU; or an explicit encoder
 encoder_explicit=0 # Track whether -c was user-set (distinguishes a config-driven default)
 target_size_mb="${CONFIG_TARGET_SIZE_MB:-19.8}"
 min_video_bitrate_kbps="${CONFIG_MIN_VIDEO_BITRATE:-500}"
@@ -291,8 +293,7 @@ done
 shift $((OPTIND - 1))
 
 # --- Configuration Constants ---
-MAX_SIZE_MB=$(echo "$target_size_mb" | awk '{print ($1 > int($1) ? int($1)+1 : int($1))}')
-[ -z "$MAX_SIZE_MB" ] || [ "$MAX_SIZE_MB" -lt 1 ] && MAX_SIZE_MB=20
+MAX_SIZE_MB="$target_size_mb"
 OVERHEAD_KB=200
 MAX_VIDEO_BITRATE_KBPS=50000
 SUMMARY_FILE="optimization_summary.txt"
@@ -374,12 +375,22 @@ bail_out() { # Fatal error handler.
     exit 1
 }
 
+valid_integer() { [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge "$2" ] && [ "$1" -le "$3" ]; }
+[[ "$target_size_mb" =~ ^[0-9]+([.][0-9]+)?$ ]] || { echo "Invalid target size" >&2; exit 1; }
+awk -v n="$target_size_mb" 'BEGIN { exit !(n >= 0.25 && n <= 100000) }' || exit 1
+valid_integer "$min_video_bitrate_kbps" 50 50000 &&
+valid_integer "$min_audio_bitrate_kbps" 16 512 &&
+valid_integer "$INITIAL_AUDIO_BITRATE_KBPS" "$min_audio_bitrate_kbps" 512 &&
+valid_integer "$max_retries" 1 10 && valid_integer "$CRF_RESCUE_VALUE" 1 51 || {
+    echo "Invalid bitrate, retries or rescue quality" >&2; exit 1;
+}
+
 # Crash Cleanup
 
 cleanup_artifacts() {
     if [ "$cleanup" -eq 1 ] && [ -d "$OUTPUT_DIR" ]; then
-        # Changed pattern to "*pass*" to catch both ffmpeg2pass and rescue_pass logs
-        find "$OUTPUT_DIR/" -maxdepth 1 -type f \( -name "*pass*" -o -name "*_temp_*.mp4" -o -name "*_error_*.txt" -o -name "*_loudnorm_*.json" \) -delete 2>/dev/null
+        # Delete only this invocation's scratch directory, never user files.
+        case "$OUTPUT_DIR" in "$FINAL_OUTPUT_DIR"/.shrinkwrap-*) rm -rf -- "$OUTPUT_DIR" ;; esac
     fi
 }
 
@@ -461,7 +472,8 @@ resolve_software() {
     for enc in $SOFTWARE_ORDER; do
         if encoder_available "$enc"; then echo "$enc"; return 0; fi
     done
-    echo "libx264"
+    echo "No supported software encoder found" >&2
+    return 1
 }
 
 # --- Hardware-encoder support (opt-in via -c) ---------------------------------
@@ -598,6 +610,7 @@ build_hw_video_args() { # <family> <mode> <bitrate_kbps> <maxrate_kbps>
             fi
             ;;
         videotoolbox)
+            printf -- "-allow_sw 0 "
             # No preset knob and no stable CQ flag -> capped VBR; cq mode targets the budget.
             if [ "$mode" = cq ]; then
                 printf -- "-b:v %sk -maxrate %sk -bufsize %sk" "$maxrate" "$maxrate" "$bufsize"
@@ -613,6 +626,7 @@ build_hw_video_args() { # <family> <mode> <bitrate_kbps> <maxrate_kbps>
 # (compiled-in != usable for hardware, so the name grep alone is not trustworthy).
 probe_encoder() { # <encoder>
     local enc="$1" family
+    encoder_available "$enc" || return 1
     family=$(codec_family "$enc")
     local -a rc=()
     if [ "$family" = software ]; then
@@ -621,8 +635,15 @@ probe_encoder() { # <encoder>
         # shellcheck disable=SC2206
         rc=($(build_hw_video_args "$family" bitrate 1000 1000))
     fi
-    ffmpeg -hide_banner -loglevel error -f lavfi -i testsrc=s=256x144:d=0.1 -frames:v 1 \
-        -c:v "$enc" "${rc[@]}" -f null - >/dev/null 2>&1
+    local -a command=(ffmpeg -hide_banner -loglevel error -f lavfi -i testsrc2=s=256x144:d=0.3 -frames:v 8 -pix_fmt yuv420p
+        -c:v "$enc" "${rc[@]}" -f null -)
+    if command -v timeout >/dev/null 2>&1; then
+        timeout 10s "${command[@]}" >/dev/null 2>&1
+    elif command -v gtimeout >/dev/null 2>&1; then
+        gtimeout 10s "${command[@]}" >/dev/null 2>&1
+    else
+        "${command[@]}" >/dev/null 2>&1
+    fi
 }
 
 select_encoder() { # Sets globals VIDEO_CODEC + CODEC_FAMILY + CODEC_SOURCE.
@@ -634,9 +655,9 @@ select_encoder() { # Sets globals VIDEO_CODEC + CODEC_FAMILY + CODEC_SOURCE.
     elif [ "$CONFIG_FOUND" -eq 1 ]; then
         case "$MODE" in
             hardware)      choice="hw" ;;
-            software)      choice="auto" ;;
+            software)      choice="software" ;;
             software_x264) choice="software_x264" ;;
-            *)             choice="auto" ;;            # unknown mode -> safe software default
+            *)             choice="$MODE" ;;            # unknown mode -> safe software default
         esac
         CODEC_SOURCE="config: $MODE"
     else
@@ -644,16 +665,26 @@ select_encoder() { # Sets globals VIDEO_CODEC + CODEC_FAMILY + CODEC_SOURCE.
         CODEC_SOURCE="default"
     fi
 
+    case "$choice" in auto|hw|software|software_x264|libx264|libx265) ;; *)
+        case " $DEFAULT_HARDWARE_ORDER " in *" $choice "*) ;; *) bail_out "Unsupported encoder: $choice" ;; esac ;;
+    esac
+    for enc in $HARDWARE_ORDER; do
+        case " $DEFAULT_HARDWARE_ORDER " in *" $enc "*) ;; *) bail_out "Unsupported hardware encoder: $enc" ;; esac
+    done
+    for enc in $SOFTWARE_ORDER; do
+        case "$enc" in libx264|libx265) ;; *) bail_out "Unsupported software encoder: $enc" ;; esac
+    done
+    [ "$choice" = auto ] && choice=hw
     # 2. Resolve the choice to a concrete encoder.
     case "$choice" in
-        auto)
-            VIDEO_CODEC=$(resolve_software)            # software list via cheap grep
+        software)
+            VIDEO_CODEC=$(resolve_software) || bail_out "No software encoder available"            # software list via cheap grep
             ;;
         software_x264)
             if encoder_available libx264; then
                 VIDEO_CODEC="libx264"
             else
-                VIDEO_CODEC=$(resolve_software)
+                VIDEO_CODEC=$(resolve_software) || bail_out "No software encoder available"
             fi
             ;;
         hw)
@@ -663,7 +694,7 @@ select_encoder() { # Sets globals VIDEO_CODEC + CODEC_FAMILY + CODEC_SOURCE.
                 if probe_encoder "$enc"; then VIDEO_CODEC="$enc"; break; fi
             done
             if [ -z "$VIDEO_CODEC" ]; then
-                VIDEO_CODEC=$(resolve_software)
+                VIDEO_CODEC=$(resolve_software) || bail_out "No software encoder available"
                 printf "%s  [Encoder] No working hardware encoder found; using software (%s).%s\n" "$C_YELLOW" "$VIDEO_CODEC" "$C_RESET"
             else
                 say_ok "[Encoder] Hardware encoder: $VIDEO_CODEC"
@@ -674,7 +705,7 @@ select_encoder() { # Sets globals VIDEO_CODEC + CODEC_FAMILY + CODEC_SOURCE.
                 VIDEO_CODEC="$choice"
                 say_ok "[Encoder] Using $VIDEO_CODEC"
             else
-                VIDEO_CODEC=$(resolve_software)
+                VIDEO_CODEC=$(resolve_software) || bail_out "No software encoder available"
                 printf "%s  [Encoder] '%s' failed validation; falling back to software (%s).%s\n" "$C_YELLOW" "$choice" "$VIDEO_CODEC" "$C_RESET"
             fi
             ;;
@@ -696,7 +727,7 @@ audio_out_args() { # <bitrate_kbps>
 
 # Bytes to reserve for audio in the size budget: 0 when audio is stripped, else <kbps>*dur.
 audio_budget_bytes() { # <bitrate_kbps> <duration_sec>
-    if [ "$remove_audio" -eq 1 ]; then echo 0; else echo "$1 * 1000 * $2 / 8" | bc -l; fi
+    if [ "$remove_audio" -eq 1 ] || [ "${input_has_audio:-1}" -eq 0 ]; then echo 0; else echo "$1 * 1000 * $2 / 8" | bc -l; fi
 }
 
 # Single-pass hardware encode that plugs into the same run_with_progress + size-check
@@ -720,6 +751,27 @@ hw_encode() { # <input> <desc> <duration> <mode> <bitrate> <maxrate> <scale> <au
         -c:v "$VIDEO_CODEC" -pix_fmt yuv420p "${vargs[@]}" \
         -vf "$scale" "${aout[@]}" \
         -map_metadata 0 -movflags +faststart "$output" 2>"$logf"
+    local status=$?
+    [ "$status" -eq 0 ] && return 0
+    echo "  [Encoder] GPU encode failed on this input; retrying with software."
+    VIDEO_CODEC=$(resolve_software) || return 1
+    CODEC_FAMILY=software
+    preset=$(resolve_preset_token software "$preset")
+    local fallback_log="$OUTPUT_DIR/software_fallback_${RANDOM}"
+    if [ "$mode" = cq ]; then
+        run_with_progress "Software rescue" "$duration" ffmpeg -y -i "$input" $VSYNC_FLAG \
+            -c:v "$VIDEO_CODEC" -pix_fmt yuv420p -preset "$preset" -crf "$CRF_RESCUE_VALUE" \
+            -maxrate "${maxrate}k" -bufsize "$((maxrate * 2))k" -vf "$scale" "${aout[@]}" \
+            -movflags +faststart "$output" 2>"$fallback_log.log"
+    else
+        run_with_progress "Software pass 1" "$duration" ffmpeg -y -i "$input" $VSYNC_FLAG \
+            -c:v "$VIDEO_CODEC" -pix_fmt yuv420p -preset "$preset" -b:v "${bitrate}k" \
+            -pass 1 -passlogfile "$fallback_log" -vf "$scale" -an -f null /dev/null 2>"$fallback_log.log" &&
+        run_with_progress "Software pass 2" "$duration" ffmpeg -y -i "$input" $VSYNC_FLAG \
+            -c:v "$VIDEO_CODEC" -pix_fmt yuv420p -preset "$preset" -b:v "${bitrate}k" \
+            -pass 2 -passlogfile "$fallback_log" -vf "$scale" "${aout[@]}" \
+            -movflags +faststart "$output" 2>>"$fallback_log.log"
+    fi
 }
 
 detect_vsync_flag() { # Determines if we should use the modern -fps_mode or legacy -vsync
@@ -743,7 +795,7 @@ get_file_size_mb() { # Return file size in MB with decimal precision.
         return 0
     fi
     size_bytes=$(wc -c < "$file") || return 1
-    echo "scale=3; $size_bytes / 1048576" | bc -l
+    echo "scale=9; $size_bytes / 1000000" | bc -l
 }
 
 get_duration() { # Extract duration via ffprobe (container first, then video stream).
@@ -775,7 +827,7 @@ analyze_audio_loudness() {
     echo "  [Audio Analysis] Measuring loudness (two-pass mode)..." >&2
     
     # Run loudnorm analysis pass
-    ffmpeg -i "$input_file" -af loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json -f null - 2>&1 | \
+    ffmpeg -nostdin -hide_banner -i "$input_file" -vn -sn -dn -af loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json -f null - 2>&1 | \
         grep -A 12 "Parsed_loudnorm" | grep -A 12 "{" > "$json_file"
     
     if [ ! -s "$json_file" ]; then
@@ -847,14 +899,22 @@ rescue_video() { # Fallback Strategy: Downscale to 720p to maintain bitrate dens
     local input_file="$1"
     local part_suffix="${2:-}"
     local orig_size_mb="$3"
-    local filename=$(basename_noext "$input_file")
-    local output_file="${OUTPUT_DIR}/${filename}${part_suffix}_optimized.mp4"
+    local filename="$BASE_NAME"
+    local output_file="${FINAL_OUTPUT_DIR}/${filename}${part_suffix}_optimized.mp4"
     local temp_file="${OUTPUT_DIR}/${filename}${part_suffix}_temp_$$_${RANDOM}.mp4"
     local passlog="${OUTPUT_DIR}/rescue_pass_$$_${RANDOM}"
     
+    local video_type
+    video_type=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of default=noprint_wrappers=1:nokey=1 "$input_file" 2>/dev/null)
+    if [ "$video_type" != video ]; then
+        record_summary "$filename$part_suffix" "$(get_file_size_mb "$input_file")" "N/A" "Invalid Input Fail"
+        return 1
+    fi
+    local input_has_audio=0
+    [ "$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_type -of default=noprint_wrappers=1:nokey=1 "$input_file" 2>/dev/null)" = audio ] && input_has_audio=1
     # Get audio filter (two-pass if enabled)
     local audio_filter_args=""
-    if [ "$normalize_audio" -eq 1 ] && [ "$remove_audio" -eq 0 ]; then
+    if [ "$normalize_audio" -eq 1 ] && [ "$remove_audio" -eq 0 ] && [ "$input_has_audio" -eq 1 ]; then
         local filter=$(get_audio_filter "$input_file")
         if [ -n "$filter" ]; then
             audio_filter_args="-af $filter"
@@ -865,7 +925,7 @@ rescue_video() { # Fallback Strategy: Downscale to 720p to maintain bitrate dens
 
     # --- 1. Calculate Target Bitrate ---
     local duration=$(get_duration "$input_file")
-    local target_size_bytes=$(echo "$target_size_mb * 1024 * 1024" | bc -l)
+    local target_size_bytes=$(echo "$target_size_mb * 1000000" | bc -l)
     local overhead_bytes=$(echo "$OVERHEAD_KB * 1024" | bc -l)
     
     local est_audio_bytes=$(audio_budget_bytes "$min_audio_bitrate_kbps" "$duration")
@@ -889,17 +949,19 @@ rescue_video() { # Fallback Strategy: Downscale to 720p to maintain bitrate dens
 
         if [ "$CODEC_FAMILY" = software ]; then
         run_with_progress "Pass 1" "$duration" ffmpeg -y -i "$input_file" $VSYNC_FLAG -pass 1 -passlogfile "$passlog" -c:v "$VIDEO_CODEC" -pix_fmt yuv420p -b:v "${current_video_kbps}k" -preset "$preset" \
-            -vf "scale='min(1920,iw)':-2" -an -f null /dev/null 2>"${OUTPUT_DIR}/rescue_1080p_pass1_error_${filename}.txt" && \
+            -vf "scale='min(1920,trunc(iw/2)*2)':-2" -an -f null /dev/null 2>"${OUTPUT_DIR}/rescue_1080p_pass1_error_${filename}.txt" && \
         run_with_progress "Pass 2" "$duration" ffmpeg -y -i "$input_file" $VSYNC_FLAG -pass 2 -passlogfile "$passlog" -c:v "$VIDEO_CODEC" -pix_fmt yuv420p -b:v "${current_video_kbps}k" -preset "$preset" \
-            -vf "scale='min(1920,iw)':-2" $(audio_out_args "${min_audio_bitrate_kbps}") -map_metadata 0 -movflags +faststart "$output_file" 2>"${OUTPUT_DIR}/rescue_1080p_pass2_error_${filename}.txt"
+            -vf "scale='min(1920,trunc(iw/2)*2)':-2" $(audio_out_args "${min_audio_bitrate_kbps}") -map_metadata 0 -movflags +faststart "$temp_file" 2>"${OUTPUT_DIR}/rescue_1080p_pass2_error_${filename}.txt"
         else
-            hw_encode "$input_file" "Encode" "$duration" bitrate "$current_video_kbps" "$current_video_kbps" "scale='min(1920,iw)':-2" "$min_audio_bitrate_kbps" "$output_file" $audio_filter_args
+            hw_encode "$input_file" "Encode" "$duration" bitrate "$current_video_kbps" "$current_video_kbps" "scale='min(1920,trunc(iw/2)*2)':-2" "$min_audio_bitrate_kbps" "$temp_file" $audio_filter_args
         fi
 
-        local final_size=$(get_file_size_mb "$output_file")
+        local encode_exit=$?
+        local final_size=$(get_file_size_mb "$temp_file")
 
         # Validation
-        if (( $(echo "$final_size <= $target_size_mb" | bc -l) )) && (( $(echo "$final_size > 0" | bc -l) )); then
+        if [ "$encode_exit" -eq 0 ] && (( $(echo "$final_size <= $target_size_mb" | bc -l) )) && (( $(echo "$final_size > 0" | bc -l) )); then
+            mv -f -- "$temp_file" "$output_file" || return 1
             record_summary "$filename" "$(get_file_size_mb "$input_file")" "$final_size" "Rescued (1080p)"
             echo "  [Rescue] Success: $output_file ($final_size MB) - Native Resolution Preserved"
             rm -f "${passlog}"-* 2>/dev/null
@@ -941,16 +1003,18 @@ rescue_video() { # Fallback Strategy: Downscale to 720p to maintain bitrate dens
 
         if [ "$CODEC_FAMILY" = software ]; then
         run_with_progress "Pass 1" "$duration" ffmpeg -y -i "$input_file" $VSYNC_FLAG -pass 1 -passlogfile "$passlog" -c:v "$VIDEO_CODEC" -pix_fmt yuv420p -b:v "${current_video_kbps}k" -preset "$preset" \
-            -vf "scale='min(1280,iw)':-2" -an -f null /dev/null 2>"${OUTPUT_DIR}/rescue_720p_pass1_error_${filename}.txt" && \
+            -vf "scale='min(1280,trunc(iw/2)*2)':-2" -an -f null /dev/null 2>"${OUTPUT_DIR}/rescue_720p_pass1_error_${filename}.txt" && \
         run_with_progress "Pass 2" "$duration" ffmpeg -y -i "$input_file" $VSYNC_FLAG -pass 2 -passlogfile "$passlog" -c:v "$VIDEO_CODEC" -pix_fmt yuv420p -b:v "${current_video_kbps}k" -preset "$preset" \
-            -vf "scale='min(1280,iw)':-2" $(audio_out_args "${min_audio_bitrate_kbps}") -map_metadata 0 -movflags +faststart "$output_file" 2>"${OUTPUT_DIR}/rescue_720p_pass2_error_${filename}.txt"
+            -vf "scale='min(1280,trunc(iw/2)*2)':-2" $(audio_out_args "${min_audio_bitrate_kbps}") -map_metadata 0 -movflags +faststart "$temp_file" 2>"${OUTPUT_DIR}/rescue_720p_pass2_error_${filename}.txt"
         else
-            hw_encode "$input_file" "Encode" "$duration" bitrate "$current_video_kbps" "$current_video_kbps" "scale='min(1280,iw)':-2" "$min_audio_bitrate_kbps" "$output_file" $audio_filter_args
+            hw_encode "$input_file" "Encode" "$duration" bitrate "$current_video_kbps" "$current_video_kbps" "scale='min(1280,trunc(iw/2)*2)':-2" "$min_audio_bitrate_kbps" "$temp_file" $audio_filter_args
         fi
 
-        local final_size=$(get_file_size_mb "$output_file")
+        local encode_exit=$?
+        local final_size=$(get_file_size_mb "$temp_file")
 
-        if (( $(echo "$final_size <= $target_size_mb" | bc -l) )) && (( $(echo "$final_size > 0" | bc -l) )); then
+        if [ "$encode_exit" -eq 0 ] && (( $(echo "$final_size <= $target_size_mb" | bc -l) )) && (( $(echo "$final_size > 0" | bc -l) )); then
+            mv -f -- "$temp_file" "$output_file" || return 1
             record_summary "$filename" "$(get_file_size_mb "$input_file")" "$final_size" "Rescued (720p)"
             echo "  [Rescue] Success: $output_file ($final_size MB) - Downscaled to 720p"
             rm -f "${passlog}"-* 2>/dev/null
@@ -983,15 +1047,16 @@ rescue_video() { # Fallback Strategy: Downscale to 720p to maintain bitrate dens
     echo "  [Rescue] Phase 3: Last resort capped CRF ${CRF_RESCUE_VALUE:-28} @ 720p (maxrate ${crf_maxrate_kbps}k)..."
     if [ "$CODEC_FAMILY" = software ]; then
     run_with_progress "CRF Pass" "$duration" ffmpeg -y -i "$input_file" $VSYNC_FLAG -c:v "$VIDEO_CODEC" -pix_fmt yuv420p -crf "${CRF_RESCUE_VALUE:-28}" -maxrate "${crf_maxrate_kbps}k" -bufsize "${crf_bufsize_kbps}k" -preset "$preset" \
-        -vf "scale='min(1280,iw)':-2" $(audio_out_args 64) -map_metadata 0 -movflags +faststart "$temp_file" 2>/dev/null
+        -vf "scale='min(1280,trunc(iw/2)*2)':-2" $(audio_out_args 64) -map_metadata 0 -movflags +faststart "$temp_file" 2>/dev/null
     else
-        hw_encode "$input_file" "CRF Pass" "$duration" cq "$crf_maxrate_kbps" "$crf_maxrate_kbps" "scale='min(1280,iw)':-2" 64 "$temp_file" $audio_filter_args
+        hw_encode "$input_file" "CRF Pass" "$duration" cq "$crf_maxrate_kbps" "$crf_maxrate_kbps" "scale='min(1280,trunc(iw/2)*2)':-2" 64 "$temp_file" $audio_filter_args
     fi
 
+    local crf_exit=$?
     local crf_size=$(get_file_size_mb "$temp_file")
 
-    if (( $(echo "$crf_size <= $target_size_mb" | bc -l) )) && (( $(echo "$crf_size > 0" | bc -l) )); then
-        mv "$temp_file" "$output_file"
+    if [ "$crf_exit" -eq 0 ] && (( $(echo "$crf_size <= $target_size_mb" | bc -l) )) && (( $(echo "$crf_size > 0" | bc -l) )); then
+        mv "$temp_file" "$temp_file"
         record_summary "$filename" "$(get_file_size_mb "$input_file")" "$crf_size" "Rescued (CRF)"
         echo "  [Rescue] Success (CRF): $output_file ($crf_size MB)"
         rm -f "${passlog}"-* 2>/dev/null
@@ -1007,7 +1072,7 @@ rescue_video() { # Fallback Strategy: Downscale to 720p to maintain bitrate dens
 
 split_video() { # Temporal Segmentation: Split video at nearest keyframe.
     local input_file="$1" part_suffix="$2" 
-    local filename=$(basename_noext "$input_file")
+    local filename="$BASE_NAME"
     local duration
     duration=$(get_duration "$input_file") || { record_summary "$filename$part_suffix" "$(get_file_size_mb "$input_file")" "N/A" "Split Duration Fail"; return 1; }
 
@@ -1015,7 +1080,7 @@ split_video() { # Temporal Segmentation: Split video at nearest keyframe.
     # Calculate if even at minimum bitrates we can't fit
     local absolute_min_video_bytes=$(echo "$min_video_bitrate_kbps * 1000 * $duration / 8" | bc -l)
     local absolute_min_audio_bytes=$(audio_budget_bytes "$min_audio_bitrate_kbps" "$duration")
-    local absolute_min_total=$(echo "($absolute_min_video_bytes + $absolute_min_audio_bytes) / 1048576" | bc -l)
+    local absolute_min_total=$(echo "($absolute_min_video_bytes + $absolute_min_audio_bytes) / 1000000" | bc -l)
 
     # If mathematically impossible, proceed with split (below)
     # If rescue might work, try that instead
@@ -1025,6 +1090,10 @@ split_video() { # Temporal Segmentation: Split video at nearest keyframe.
             return 0
         fi
         echo "  Rescue failed. Falling back to keyframe split..."
+    fi
+    if [ "${#part_suffix}" -gt 56 ] || (( $(echo "$duration < 1" | bc -l) )); then
+        record_summary "$filename$part_suffix" "$(get_file_size_mb "$input_file")" "N/A" "Split Limit Fail"
+        return 1
     fi
     # Continue with actual split logic...
     echo "  Video too long for target size even at minimum bitrates. Must split."
@@ -1084,15 +1153,24 @@ split_video() { # Temporal Segmentation: Split video at nearest keyframe.
 
 optimize_video() { # Primary Optimization Pipeline: 2-Pass HEVC Encoding.
     local input_file="$1" part_suffix="${2:-}"
-    local filename=$(basename_noext "$input_file")
-    local output_file="${OUTPUT_DIR}/${filename}${part_suffix}_optimized.mp4"
+    local filename="$BASE_NAME"
+    local output_file="${FINAL_OUTPUT_DIR}/${filename}${part_suffix}_optimized.mp4"
     local temp_file="${OUTPUT_DIR}/${filename}${part_suffix}_temp_$$_${RANDOM}.mp4"
     local passlog="${OUTPUT_DIR}/ffmpeg2pass_$$_${RANDOM}"
     mkdir -p "$OUTPUT_DIR"
+    [ -e "$output_file" ] && { echo "Output already exists: $output_file" >&2; return 1; }
     
+    local video_type
+    video_type=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of default=noprint_wrappers=1:nokey=1 "$input_file" 2>/dev/null)
+    if [ "$video_type" != video ]; then
+        record_summary "$filename$part_suffix" "$(get_file_size_mb "$input_file")" "N/A" "Invalid Input Fail"
+        return 1
+    fi
+    local input_has_audio=0
+    [ "$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_type -of default=noprint_wrappers=1:nokey=1 "$input_file" 2>/dev/null)" = audio ] && input_has_audio=1
     # Get audio filter (two-pass if enabled)
     local audio_filter_args=""
-    if [ "$normalize_audio" -eq 1 ] && [ "$remove_audio" -eq 0 ]; then
+    if [ "$normalize_audio" -eq 1 ] && [ "$remove_audio" -eq 0 ] && [ "$input_has_audio" -eq 1 ]; then
         local filter=$(get_audio_filter "$input_file")
         if [ -n "$filter" ]; then
             audio_filter_args="-af $filter"
@@ -1109,7 +1187,7 @@ optimize_video() { # Primary Optimization Pipeline: 2-Pass HEVC Encoding.
     
     say_info "Processing: $input_file (Original: ${orig_size_mb}MB)"
 
-    if (( $(echo "$orig_size_mb < $MAX_SIZE_MB" | bc -l) )); then # Input already satisfies constraints
+    if (( $(echo "$orig_size_mb <= $MAX_SIZE_MB" | bc -l) )) && [ "$normalize_audio" -eq 0 ] && [ "$audio_channels" -eq 2 ]; then # Input already satisfies constraints
         # A non-MP4 input that already fits must still be remuxed: a byte copy would hand back
         # a Matroska/WebM stream wearing an .mp4 extension, which Discord will not play inline.
         # If the codecs cannot live in MP4, fall through to a real encode instead of emitting a
@@ -1119,24 +1197,21 @@ optimize_video() { # Primary Optimization Pipeline: 2-Pass HEVC Encoding.
         if [ "$remove_audio" -eq 1 ]; then
             # Honor -A even on the no-encode fast path: stream-copy the video and drop audio
             # (lossless, no re-encode); plain copy only when the input is already MP4.
-            if ! ffmpeg -y -i "$input_file" -c copy -an -movflags +faststart "$output_file" 2>/dev/null; then
-                if [ "$in_ext" = "mp4" ]; then
-                    cp "$input_file" "$output_file" || { record_summary "$filename$part_suffix" "$orig_size_mb" "N/A" "Copy Fail"; return 1; }
-                else
-                    fastpath_ok=0
-                fi
+            if ! ffmpeg -y -i "$input_file" -c copy -an -movflags +faststart "$temp_file" 2>/dev/null; then
+                fastpath_ok=0
             fi
         elif [ "$in_ext" = "mp4" ]; then
-            cp "$input_file" "$output_file" || { record_summary "$filename$part_suffix" "$orig_size_mb" "N/A" "Copy Fail"; return 1; }
+            cp "$input_file" "$temp_file" || { record_summary "$filename$part_suffix" "$orig_size_mb" "N/A" "Copy Fail"; return 1; }
         else
-            ffmpeg -y -i "$input_file" -c copy -movflags +faststart "$output_file" 2>/dev/null || fastpath_ok=0
+            ffmpeg -y -i "$input_file" -c copy -movflags +faststart "$temp_file" 2>/dev/null || fastpath_ok=0
         fi
-        if [ "$fastpath_ok" -eq 1 ]; then
+        if [ "$fastpath_ok" -eq 1 ] && (( $(echo "$(get_file_size_mb "$temp_file") <= $target_size_mb" | bc -l) )); then
+            mv -- "$temp_file" "$output_file" || return 1
             record_summary "$filename$part_suffix" "$orig_size_mb" "$(get_file_size_mb "$output_file")" "Copied"
             echo "Copied: $output_file"
             return 0
         fi
-        rm -f "$output_file"
+        rm -f "$temp_file"
         echo "  [Info] Input fits but cannot be remuxed to MP4 losslessly; re-encoding."
     fi
 
@@ -1145,7 +1220,7 @@ optimize_video() { # Primary Optimization Pipeline: 2-Pass HEVC Encoding.
     duration=$(printf "%.3f" "$duration")
 
     local audio_bitrate_kbps=$INITIAL_AUDIO_BITRATE_KBPS
-    local target_size_bytes=$(echo "$target_size_mb * 1024 * 1024" | bc -l)
+    local target_size_bytes=$(echo "$target_size_mb * 1000000" | bc -l)
     local overhead_bytes=$(echo "$OVERHEAD_KB * 1024" | bc -l)
 
     # Bitrate Derivation: (Target - Audio - Overhead) / Duration
@@ -1177,11 +1252,11 @@ optimize_video() { # Primary Optimization Pipeline: 2-Pass HEVC Encoding.
 
         if [ "$CODEC_FAMILY" = software ]; then
         run_with_progress "Pass 1" "$duration" ffmpeg -y -i "$input_file" $VSYNC_FLAG -pass 1 -passlogfile "$passlog" -c:v "$VIDEO_CODEC" -pix_fmt yuv420p -b:v "${current_video_bitrate_kbps}k" -preset "$preset" \
-            -vf "scale='min(1920,iw)':-2" -an -f null /dev/null 2>"${OUTPUT_DIR}/ffmpeg_pass1_error_${filename}${part_suffix}.txt" && \
+            -vf "scale='min(1920,trunc(iw/2)*2)':-2" -an -f null /dev/null 2>"${OUTPUT_DIR}/ffmpeg_pass1_error_${filename}${part_suffix}.txt" && \
         run_with_progress "Pass 2" "$duration" ffmpeg -y -i "$input_file" $VSYNC_FLAG -pass 2 -passlogfile "$passlog" -c:v "$VIDEO_CODEC" -pix_fmt yuv420p -b:v "${current_video_bitrate_kbps}k" -preset "$preset" \
-            -vf "scale='min(1920,iw)':-2" $(audio_out_args "${audio_bitrate_kbps}") -map_metadata 0 -movflags +faststart "$temp_file" 2>"${OUTPUT_DIR}/ffmpeg_pass2_error_${filename}${part_suffix}.txt"
+            -vf "scale='min(1920,trunc(iw/2)*2)':-2" $(audio_out_args "${audio_bitrate_kbps}") -map_metadata 0 -movflags +faststart "$temp_file" 2>"${OUTPUT_DIR}/ffmpeg_pass2_error_${filename}${part_suffix}.txt"
         else
-            hw_encode "$input_file" "Encode" "$duration" bitrate "$current_video_bitrate_kbps" "$current_video_bitrate_kbps" "scale='min(1920,iw)':-2" "$audio_bitrate_kbps" "$temp_file" $audio_filter_args
+            hw_encode "$input_file" "Encode" "$duration" bitrate "$current_video_bitrate_kbps" "$current_video_bitrate_kbps" "scale='min(1920,trunc(iw/2)*2)':-2" "$audio_bitrate_kbps" "$temp_file" $audio_filter_args
         fi
 
         if [ $? -ne 0 ]; then
@@ -1194,7 +1269,7 @@ optimize_video() { # Primary Optimization Pipeline: 2-Pass HEVC Encoding.
         local final_size_mb=$(get_file_size_mb "$temp_file") || final_size_mb="N/A"
         echo "  Result: ${final_size_mb}MB"
 
-        if (( $(echo "$final_size_mb <= $MAX_SIZE_MB" | bc -l) )); then
+        if (( $(echo "$final_size_mb > 0 && $final_size_mb <= $MAX_SIZE_MB" | bc -l) )); then
             mv "$temp_file" "$output_file"
 
             # Bidirectional convergence: if we landed well under target, reclaim the
@@ -1211,11 +1286,11 @@ optimize_video() { # Primary Optimization Pipeline: 2-Pass HEVC Encoding.
 
                 if [ "$CODEC_FAMILY" = software ]; then
                 run_with_progress "Pass 1" "$duration" ffmpeg -y -i "$input_file" $VSYNC_FLAG -pass 1 -passlogfile "$passlog" -c:v "$VIDEO_CODEC" -pix_fmt yuv420p -b:v "${upward_kbps}k" -preset "$preset" \
-                    -vf "scale='min(1920,iw)':-2" -an -f null /dev/null 2>"${OUTPUT_DIR}/ffmpeg_pass1_error_${filename}${part_suffix}.txt" && \
+                    -vf "scale='min(1920,trunc(iw/2)*2)':-2" -an -f null /dev/null 2>"${OUTPUT_DIR}/ffmpeg_pass1_error_${filename}${part_suffix}.txt" && \
                 run_with_progress "Pass 2" "$duration" ffmpeg -y -i "$input_file" $VSYNC_FLAG -pass 2 -passlogfile "$passlog" -c:v "$VIDEO_CODEC" -pix_fmt yuv420p -b:v "${upward_kbps}k" -preset "$preset" \
-                    -vf "scale='min(1920,iw)':-2" $(audio_out_args "${audio_bitrate_kbps}") -map_metadata 0 -movflags +faststart "$temp_file" 2>"${OUTPUT_DIR}/ffmpeg_pass2_error_${filename}${part_suffix}.txt"
+                    -vf "scale='min(1920,trunc(iw/2)*2)':-2" $(audio_out_args "${audio_bitrate_kbps}") -map_metadata 0 -movflags +faststart "$temp_file" 2>"${OUTPUT_DIR}/ffmpeg_pass2_error_${filename}${part_suffix}.txt"
                 else
-                    hw_encode "$input_file" "Encode" "$duration" bitrate "$upward_kbps" "$upward_kbps" "scale='min(1920,iw)':-2" "$audio_bitrate_kbps" "$temp_file" $audio_filter_args
+                    hw_encode "$input_file" "Encode" "$duration" bitrate "$upward_kbps" "$upward_kbps" "scale='min(1920,trunc(iw/2)*2)':-2" "$audio_bitrate_kbps" "$temp_file" $audio_filter_args
                 fi
 
                 if [ $? -eq 0 ]; then
@@ -1282,14 +1357,15 @@ optimize_video() { # Primary Optimization Pipeline: 2-Pass HEVC Encoding.
 
     if [ "$CODEC_FAMILY" = software ]; then
     run_with_progress "CRF Pass" "$duration" ffmpeg -y -i "$input_file" $VSYNC_FLAG -c:v "$VIDEO_CODEC" -pix_fmt yuv420p -crf "${CRF_RESCUE_VALUE:-28}" -maxrate "${crf_maxrate_kbps}k" -bufsize "${crf_bufsize_kbps}k" -preset "$preset" \
-        -vf "scale='min(1920,iw)':-2" $(audio_out_args 64) -map_metadata 0 -movflags +faststart "$temp_file" 2>/dev/null
+        -vf "scale='min(1920,trunc(iw/2)*2)':-2" $(audio_out_args 64) -map_metadata 0 -movflags +faststart "$temp_file" 2>/dev/null
     else
-        hw_encode "$input_file" "CRF Pass" "$duration" cq "$crf_maxrate_kbps" "$crf_maxrate_kbps" "scale='min(1920,iw)':-2" 64 "$temp_file" $audio_filter_args
+        hw_encode "$input_file" "CRF Pass" "$duration" cq "$crf_maxrate_kbps" "$crf_maxrate_kbps" "scale='min(1920,trunc(iw/2)*2)':-2" 64 "$temp_file" $audio_filter_args
     fi
 
+    local crf_exit=$?
     local crf_size_mb=$(get_file_size_mb "$temp_file")
     
-    if (( $(echo "$crf_size_mb <= $MAX_SIZE_MB" | bc -l) )) && (( $(echo "$crf_size_mb > 0" | bc -l) )); then
+    if [ "$crf_exit" -eq 0 ] && (( $(echo "$crf_size_mb <= $MAX_SIZE_MB" | bc -l) )) && (( $(echo "$crf_size_mb > 0" | bc -l) )); then
         mv "$temp_file" "$output_file"
         record_summary "$filename$part_suffix" "$orig_size_mb" "$crf_size_mb" "Rescued (CRF)"
         echo "Success (CRF Rescue): $output_file (${crf_size_mb}MB)"
@@ -1346,10 +1422,24 @@ fi
 to_process=()
 for file in "${files[@]}"; do
     [[ "$file" =~ _optimized\.mp4$ ]] && { printf "%sSkipping artifact: %s%s\n" "$C_DIM" "$file" "$C_RESET"; continue; }
-    [ ! -f "$file" ] && { printf "%sFile not found: %s%s\n" "$C_YELLOW" "$file" "$C_RESET"; continue; }
+    [ ! -f "$file" ] && { printf "%sFile not found: %s%s\n" "$C_YELLOW" "$file" "$C_RESET"; exit 1; }
     to_process+=("$file")
 done
 
+mkdir -p "$OUTPUT_DIR" || exit 1
+FINAL_OUTPUT_DIR=$(cd "$OUTPUT_DIR" && pwd)
+seen_names=()
+for file in "${to_process[@]}"; do
+    name=$(basename_noext "$file")
+    [ -e "$FINAL_OUTPUT_DIR/${name}_optimized.mp4" ] && bail_out "Output exists for $name; choose an empty output folder."
+    for seen in "${seen_names[@]}"; do
+        [ "$seen" = "$name" ] && bail_out "Duplicate input name: $name; rename inputs."
+    done
+    seen_names+=("$name")
+done
+OUTPUT_DIR=$(mktemp -d "$FINAL_OUTPUT_DIR/.shrinkwrap-XXXXXXXX") || exit 1
+SUMMARY_FILE="$FINAL_OUTPUT_DIR/optimization_summary.txt"
+failures=0
 total_files=${#to_process[@]}
 total_in_mb=0
 idx=0
@@ -1358,7 +1448,8 @@ for file in "${to_process[@]}"; do
     ui_file_header "$idx" "$total_files" "$(basename "$file")"
     fsize=$(get_file_size_mb "$file" 2>/dev/null) || fsize=0
     total_in_mb=$(echo "$total_in_mb + $fsize" | bc -l)
-    optimize_video "$file"
+    BASE_NAME=$(basename_noext "$file")
+    optimize_video "$file" || failures=$((failures + 1))
 done
 
 
@@ -1386,4 +1477,4 @@ ui_tally "$total_in_mb" "$total_out_mb" "$(fmt_elapsed "$SECONDS")"
 
 cleanup_artifacts
 
-exit 0
+[ "$failures" -eq 0 ]

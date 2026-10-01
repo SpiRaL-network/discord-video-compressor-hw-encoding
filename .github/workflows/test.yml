@@ -1,0 +1,30 @@
+name: Compression regression tests
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install verified FFmpeg release
+        shell: powershell
+        run: .\setup-ffmpeg.ps1 -NonInteractive
+      - name: Windows PowerShell 5.1, GUI worker and real compression
+        shell: powershell
+        run: .\tests\windows.ps1
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install FFmpeg and math tools
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg bc gawk
+      - name: Bash syntax and real compression
+        run: |
+          bash -n shrinkwrap.sh
+          bash tests/linux.sh

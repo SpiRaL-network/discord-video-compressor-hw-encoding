@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     FFmpeg Shrinkwrap - Constraint-Driven MP4 Optimizer for Discord
     Full-featured Windows port with rescue modes, splitting, and adaptive encoding
@@ -13,7 +13,8 @@
 
 .PARAMETER Encoder
     Video encoder selection. Default: auto
-      auto              Software detection (libx265, else libx264) + 2-pass (default; unchanged)
+      auto              Probe GPU encoders (AV1 -> HEVC -> H.264), then software fallback (default)
+      software          Software detection (libx265, else libx264), two-pass
       hw                Probe the GPU hierarchy (AV1 -> HEVC via AMF/NVENC/QSV/VideoToolbox),
                         falling back to software if none are functional
       <encoder name>    Force a specific encoder (e.g. hevc_nvenc, av1_amf, h264_qsv);
@@ -104,16 +105,20 @@ param(
 
     [string]$Encoder = "auto",
     [string]$Preset = "slow",
-    [double]$TargetSizeMB = 19.8,
-    [int]$MinVideoBitrate = 500,
-    [int]$MinAudioBitrate = 64,
-    [int]$MaxRetries = 3,
+    [ValidateRange(0.25, 100000)][double]$TargetSizeMB = 19.8,
+    [ValidateRange(50, 50000)][int]$MinVideoBitrate = 500,
+    [ValidateRange(16, 512)][int]$MinAudioBitrate = 64,
+    [ValidateRange(16, 512)][int]$AudioBitrate = 192,
+    [ValidateRange(1, 51)][int]$CrfRescueValue = 28,
+    [ValidateRange(1, 10)][int]$MaxRetries = 3,
     [string]$OutputDir = $null,
     [switch]$NoCleanup,
     [switch]$NormalizeAudio,
     [switch]$Mono,
     [switch]$NoAudio,
-    [switch]$Config
+    [switch]$Config,
+    [string]$ConfigPath,
+    [switch]$NonInteractive
 )
 
 $ErrorActionPreference = "Continue" # Changed from "Stop" to handle FFmpeg stderr gracefully
@@ -121,8 +126,8 @@ $ProgressPreference = "SilentlyContinue" # Disable built-in progress for speed
 
 # --- Configuration Constants ---
 $Script:MAX_SIZE_MB = 20.0
-$Script:INITIAL_AUDIO_BITRATE_KBPS = 192
-$Script:CRF_RESCUE_VALUE = 28
+$Script:INITIAL_AUDIO_BITRATE_KBPS = $AudioBitrate
+$Script:CRF_RESCUE_VALUE = $CrfRescueValue
 $Script:OVERHEAD_KB = 200
 $Script:MAX_VIDEO_BITRATE_KBPS = 50000
 $Script:OUTPUT_DIR = Join-Path (Get-Location).Path "optimized"
@@ -130,14 +135,12 @@ $Script:SUMMARY_FILE = "optimization_summary.txt"
 $Script:AudioChannels = if ($Mono) { 1 } else { 2 } # Stereo by default; -Mono downmixes
 $Script:InputExtensions = @('.mp4', '.mkv', '.mov', '.avi', '.webm', '.m4v', '.flv')
 
-# Hardware hierarchy probed for -Encoder hw (AV1-hw -> HEVC-hw). h264_* hardware is
-# intentionally absent: reachable only by explicit selection, never auto-ranked above
-# libx265. If none pass, we fall back to the software default (libx265-or-libx264).
-$Script:HwHierarchy = @('av1_amf','av1_nvenc','av1_qsv','hevc_amf','hevc_nvenc','hevc_qsv','hevc_videotoolbox')
+# Hardware hierarchy: AV1 -> HEVC -> H.264, then software fallback.
+$Script:HwHierarchy = @('av1_amf','av1_nvenc','av1_qsv','hevc_amf','hevc_nvenc','hevc_qsv','hevc_videotoolbox','h264_nvenc','h264_amf','h264_qsv','h264_videotoolbox')
 
 # Persisted-preference defaults (used when shrinkwrap.conf is absent or a key is missing).
 # $Script:HwHierarchy doubles as the default hardware_order.
-$Script:DEFAULT_MODE = 'software'
+$Script:DEFAULT_MODE = 'hardware'
 $Script:DEFAULT_SOFTWARE_ORDER = @('libx265','libx264')
 $Script:CONFIG_NAME = 'shrinkwrap.conf'
 # Track whether -Encoder was user-supplied (distinguishes a config-driven default from -Encoder auto).
@@ -226,7 +229,7 @@ function Wait-ForExit {
     # Pause for the user, but skip silently when non-interactive (CI / scheduled task)
     # so the script never hangs on Read-Host.
     param([string]$Message = "Press Enter to exit")
-    if ([Environment]::UserInteractive) {
+    if (-not $NonInteractive -and [Environment]::UserInteractive -and -not [Console]::IsInputRedirected -and -not [Console]::IsOutputRedirected) {
         Read-Host $Message | Out-Null
     }
 }
@@ -236,9 +239,12 @@ function Invoke-Cleanup {
     # Ctrl+C, so an interrupted run doesn't leave partial files behind. Respects -NoCleanup.
     if ($NoCleanup) { return }
     if (-not (Test-Path $Script:OUTPUT_DIR)) { return }
-    foreach ($Pattern in @("*_temp_*.mp4", "ffmpeg2pass*", "rescue_pass*", "ffmpeg_pass1_*", "*_loudnorm_*.json", "*.log")) {
-        Get-ChildItem -Path $Script:OUTPUT_DIR -Filter $Pattern -ErrorAction SilentlyContinue |
-            Remove-Item -Force -ErrorAction SilentlyContinue
+    # Scratch files live in a unique directory owned by this invocation.
+    $scratch = [IO.Path]::GetFullPath($Script:WORK_DIR)
+    $parent = [IO.Path]::GetFullPath($Script:FINAL_OUTPUT_DIR).TrimEnd('\') + '\'
+    if ($scratch.StartsWith($parent, [StringComparison]::OrdinalIgnoreCase) -and
+        [IO.Path]::GetFileName($scratch).StartsWith('.shrinkwrap-')) {
+        Remove-Item -LiteralPath $scratch -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
 
@@ -303,10 +309,10 @@ function Get-Duration {
 function Get-FileSizeMB {
     param([string]$FilePath)
     
-    if (-not (Test-Path $FilePath)) { return 0 }
-    $Item = Get-Item $FilePath -ErrorAction SilentlyContinue
+    if (-not (Test-Path -LiteralPath $FilePath)) { return 0 }
+    $Item = Get-Item -LiteralPath $FilePath -ErrorAction SilentlyContinue
     if (-not $Item -or $Item.Length -eq 0) { return 0 }
-    return [math]::Round($Item.Length / 1MB, 3)
+    return ($Item.Length / 1000000.0)
 }
 
 function Get-NearestKeyframe {
@@ -323,7 +329,8 @@ function Get-NearestKeyframe {
         if ($Parts[0] -eq 'N/A') { continue }
         # The flags field contains "K" for keyframe packets (e.g. "K__").
         if ($Parts[1] -match 'K') {
-            $Time = [double]$Parts[0]
+            $Time = 0.0
+            if (-not [double]::TryParse($Parts[0], [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$Time)) { continue }
             if ($Time -gt 0 -and $Time -lt $TargetTime) {
                 $LastKeyframe = $Time
             }
@@ -339,18 +346,18 @@ function Get-NearestKeyframe {
 # Bytes to reserve for audio in the size budget: 0 when audio is stripped (-NoAudio), else kbps*dur.
 function Get-AudioBudgetBytes {
     param([double]$Kbps, [double]$Duration)
-    if ($NoAudio) { return 0 }
+    if ($NoAudio -or $Script:InputHasAudio -eq $false) { return 0 }
     return $Kbps * 1000 * $Duration / 8
 }
 
 function Get-AudioLoudnessFilter {
     param([string]$InputFile)
 
-    if (-not $NormalizeAudio -or $NoAudio) {
+    if (-not $NormalizeAudio -or $NoAudio -or $Script:InputHasAudio -eq $false) {
         return $null
     }
     
-    $CacheKey = [System.IO.Path]::GetFileName($InputFile)
+    $CacheKey = [System.IO.Path]::GetFullPath($InputFile)
     
     # Check cache
     if ($Script:AudioNormCache.ContainsKey($CacheKey)) {
@@ -365,25 +372,25 @@ function Get-AudioLoudnessFilter {
     # Run analysis pass
     try {
         $AnalysisArgs = @(
-            "-i", $InputFile,
+            "-nostdin", "-hide_banner", "-i", $InputFile, "-vn", "-sn", "-dn",
             "-af", "loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json",
             "-f", "null",
             "-"
         )
 
         # loudnorm prints its JSON summary to stderr; capture it to the temp file.
-        & $Script:FFmpeg @AnalysisArgs 2> $JsonFile | Out-Null
+        & $Script:FFmpeg @AnalysisArgs 2>&1 | ForEach-Object { "$_" } | Out-File -LiteralPath $JsonFile -Encoding UTF8
 
         if (-not (Test-Path $JsonFile) -or (Get-Item $JsonFile).Length -eq 0) {
             Write-ColorOutput "  [Warning] Audio analysis failed (empty log), falling back to single-pass" "Yellow"
-            Remove-Item $JsonFile -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $JsonFile -ErrorAction SilentlyContinue
             $FallbackFilter = "loudnorm=I=-16:TP=-1.5:LRA=11"
             $Script:AudioNormCache[$CacheKey] = $FallbackFilter
             return $FallbackFilter
         }
         
         # Extract JSON from stderr (FFmpeg writes this to stderr)
-        $Content = Get-Content $JsonFile -Raw
+        $Content = Get-Content -LiteralPath $JsonFile -Raw
         
         # Find the JSON block (between curly braces after "Parsed_loudnorm")
         if ($Content -match '(?s)\{[^}]*"input_i"[^}]*\}') {
@@ -399,13 +406,19 @@ function Get-AudioLoudnessFilter {
                 $TargetOffset = $LoudnessData.target_offset
                 
                 # Validate all values exist
-                if ($InputI -and $InputTP -and $InputLRA -and $InputThresh -and $TargetOffset) {
+                $measurementsValid = $true
+                foreach ($value in @($InputI,$InputTP,$InputLRA,$InputThresh,$TargetOffset)) {
+                    $number = 0.0
+                    if (-not [double]::TryParse($value, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$number) -or
+                        [double]::IsNaN($number) -or [double]::IsInfinity($number)) { $measurementsValid = $false }
+                }
+                if ($measurementsValid) {
                     Write-ColorOutput "  [Audio Analysis] Measured: $InputI LUFS (target: -16 LUFS)" "Gray"
                     
                     $TwoPassFilter = "loudnorm=I=-16:TP=-1.5:LRA=11:measured_I=${InputI}:measured_TP=${InputTP}:measured_LRA=${InputLRA}:measured_thresh=${InputThresh}:offset=${TargetOffset}:linear=true"
                     
                     $Script:AudioNormCache[$CacheKey] = $TwoPassFilter
-                    Remove-Item $JsonFile -ErrorAction SilentlyContinue
+                    Remove-Item -LiteralPath $JsonFile -ErrorAction SilentlyContinue
                     return $TwoPassFilter
                 }
             } catch {
@@ -415,14 +428,14 @@ function Get-AudioLoudnessFilter {
         
         # Fallback to single-pass if parsing fails
         Write-ColorOutput "  [Warning] Could not parse loudness measurements, using single-pass" "Yellow"
-        Remove-Item $JsonFile -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $JsonFile -ErrorAction SilentlyContinue
         $FallbackFilter = "loudnorm=I=-16:TP=-1.5:LRA=11"
         $Script:AudioNormCache[$CacheKey] = $FallbackFilter
         return $FallbackFilter
         
     } catch {
         Write-ColorOutput "  [Warning] Audio analysis failed: $_, falling back to single-pass" "Yellow"
-        Remove-Item $JsonFile -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $JsonFile -ErrorAction SilentlyContinue
         $FallbackFilter = "loudnorm=I=-16:TP=-1.5:LRA=11"
         $Script:AudioNormCache[$CacheKey] = $FallbackFilter
         return $FallbackFilter
@@ -476,7 +489,7 @@ function Record-Summary {
     })
 }
 
-# --- Hardware-encoder support (opt-in via -Encoder) ---------------------------
+# --- Hardware-encoder support -----------------------------------------------
 # Software (libx264/libx265) drives the unchanged 2-pass path; every other family is
 # single-pass hardware (vendor rate-control + presets, no file-based 2-pass).
 function Get-CodecFamily {
@@ -596,6 +609,7 @@ function Build-HwVideoArgs {
             else                { $a += '-b:v',"${Bitrate}k",'-maxrate',"${MaxRate}k",'-bufsize',"${BufSize}k" }
         }
         'videotoolbox' {
+            $a += '-allow_sw','0'
             # No preset knob and no stable CQ flag -> capped VBR; cq mode targets the budget.
             if ($Mode -eq 'cq') { $a += '-b:v',"${MaxRate}k",'-maxrate',"${MaxRate}k",'-bufsize',"${BufSize}k" }
             else                { $a += '-b:v',"${Bitrate}k",'-maxrate',"${MaxRate}k",'-bufsize',"${BufSize}k" }
@@ -609,14 +623,33 @@ function Build-HwVideoArgs {
 # (compiled-in != usable for hardware, so the name grep alone is not trustworthy).
 function Test-Encoder {
     param([string]$Encoder)
+    if (-not (Test-EncoderAvailable $Encoder)) { return $false }
     $Family = Get-CodecFamily $Encoder
     $RcArgs = if ($Family -eq 'software') { @('-b:v','1M') }
               else { Build-HwVideoArgs -Family $Family -Mode 'bitrate' -Bitrate 1000 -MaxRate 1000 }
     $ProbeArgs = @('-hide_banner','-loglevel','error','-f','lavfi',
-                   '-i','testsrc=s=256x144:d=0.1','-frames:v','1','-c:v',$Encoder) +
+                   '-i','testsrc2=s=256x144:d=0.3','-frames:v','8','-pix_fmt','yuv420p','-c:v',$Encoder) +
                  $RcArgs + @('-f','null','-')
-    & $Script:FFmpeg @ProbeArgs 2>$null | Out-Null
-    return ($LASTEXITCODE -eq 0)
+    # These arguments are generated tokens (no user paths/text). Drain both pipes so a
+    # driver diagnostic cannot fill a buffer, and bound driver startup hangs.
+    $probe = New-Object System.Diagnostics.Process
+    $probe.StartInfo.FileName = $Script:FFmpeg
+    $probe.StartInfo.Arguments = $ProbeArgs -join ' '
+    $probe.StartInfo.UseShellExecute = $false
+    $probe.StartInfo.CreateNoWindow = $true
+    $probe.StartInfo.RedirectStandardOutput = $true
+    $probe.StartInfo.RedirectStandardError = $true
+    try {
+        $null = $probe.Start()
+        $stdout = $probe.StandardOutput.ReadToEndAsync()
+        $stderr = $probe.StandardError.ReadToEndAsync()
+        if (-not $probe.WaitForExit(10000)) {
+            $probe.Kill()
+            Write-ColorOutput "  [Encoder] Probe timed out: $Encoder" 'Yellow'
+            return $false
+        }
+        return ($probe.ExitCode -eq 0)
+    } finally { $probe.Dispose() }
 }
 
 # Codec availability: word-anchored match over a *cached* `ffmpeg -encoders` (cheap, so the
@@ -635,7 +668,7 @@ function Get-SoftwareEncoder {
     foreach ($enc in $Script:SoftwareOrder) {
         if (Test-EncoderAvailable $enc) { return $enc }
     }
-    return 'libx264'
+    throw 'No supported software encoder is available. Install FFmpeg with libx264 or libx265.'
 }
 
 # --- Persisted preferences (shrinkwrap.conf) ----------------------------------
@@ -648,6 +681,10 @@ function Get-ConfigUserDir {
 }
 
 function Get-ConfigReadPath {
+    if ($ConfigPath) {
+        if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) { throw "Config file not found: $ConfigPath" }
+        return $ConfigPath
+    }
     $sd = Join-Path $PSScriptRoot $Script:CONFIG_NAME
     if (Test-Path -LiteralPath $sd) { return $sd }
     $ud = Join-Path (Get-ConfigUserDir) $Script:CONFIG_NAME
@@ -715,18 +752,18 @@ function Write-Config {
     $normAudio = if ($Script:CfgNormalizeAudio) { $Script:CfgNormalizeAudio } else { "false" }
     $mono = if ($Script:CfgMono) { $Script:CfgMono } else { "false" }
     $noAudio = if ($Script:CfgNoAudio) { $Script:CfgNoAudio } else { "false" }
-    $audBitrate = if ($Script:CfgAudioBitrate) { $Script:CfgAudioBitrate } else { "192" }
+    $audBitrate = if (-not $PSBoundParameters.ContainsKey('AudioBitrate') -and $Script:CfgAudioBitrate) { $Script:CfgAudioBitrate } else { "192" }
     $minAudBitrate = if ($Script:CfgMinAudioBitrate) { $Script:CfgMinAudioBitrate } else { "64" }
     $minVidBitrate = if ($Script:CfgMinVideoBitrate) { $Script:CfgMinVideoBitrate } else { "500" }
     $retries = if ($Script:CfgMaxRetries) { $Script:CfgMaxRetries } else { "3" }
-    $crfRescue = if ($Script:CfgCrfRescueValue) { $Script:CfgCrfRescueValue } else { "28" }
+    $crfRescue = if (-not $PSBoundParameters.ContainsKey('CrfRescueValue') -and $Script:CfgCrfRescueValue) { $Script:CfgCrfRescueValue } else { "28" }
     $outDir = if ($Script:CfgOutputDir) { $Script:CfgOutputDir } else { "optimized" }
     $noClean = if ($Script:CfgNoCleanup) { $Script:CfgNoCleanup } else { "false" }
 
     $content = @"
 # discord-video-compressor preferences.
 # Regenerate:  ./shrinkwrap.sh --config   |   .\shrinkwrap.ps1 -Config     (or edit by hand)
-# Delete this file to return to defaults (software x265, 19.8MB target).
+# Delete this file to return to defaults (automatic hardware, 19.8 decimal MB target).
 #
 # mode: drives encoder choice when no -c/-Encoder flag is given.
 #   hardware       - walk hardware_order (GPU); fall back to software_order
@@ -797,14 +834,15 @@ function Invoke-ConfigWizard {
     Write-Host "  [1] Hardware (GPU)    Fast, offloads to GPU. Usually a bit larger / lower-quality at the"
     Write-Host "                        size cap; hardware AV1/HEVC may not play inline on Discord for"
     Write-Host "                        everyone. Falls back to software if no GPU encoder works."
-    Write-Host "  [2] Software x265     (Recommended) Best quality at the cap (libx265 2-pass); plays"
+    Write-Host "  [2] Software x265     Best quality at the cap (libx265 2-pass); plays"
     Write-Host "                        inline on Discord. Slower. Falls back to x264."
     Write-Host "  [3] Software x264     Maximum compatibility / legacy. Plays everywhere, larger files."
-    $answer = Read-Host "Your choice [2]"
+    $answer = Read-Host "Your choice [1]"
     switch ($answer) {
         '1'     { $NewMode = 'hardware' }
+        '2'     { $NewMode = 'software' }
         '3'     { $NewMode = 'software_x264' }
-        default { $NewMode = 'software' }              # empty Enter / anything else -> default
+        default { $NewMode = 'hardware' }              # empty Enter / anything else -> default
     }
     $saved = Write-Config -NewMode $NewMode
     if ($saved) {
@@ -815,7 +853,7 @@ function Invoke-ConfigWizard {
     exit 1
 }
 
-# Resolve the encoder: -Encoder flag (per-run) > config mode > built-in default (software x265).
+# Resolve the encoder: per-run flag > config mode > hardware-first default.
 # Sets $Script:VideoCodec + $Script:CodecFamily + $Script:CodecSource.
 function Resolve-Encoder {
     if ($Script:EncoderExplicit) {
@@ -824,9 +862,9 @@ function Resolve-Encoder {
     } elseif ($Script:ConfigFound) {
         switch ($Script:Mode) {
             'hardware'      { $choice = 'hw' }
-            'software'      { $choice = 'auto' }
+            'software'      { $choice = 'software' }
             'software_x264' { $choice = 'software_x264' }
-            default         { $choice = 'auto' }       # unknown mode -> safe software default
+            default         { $choice = $Script:Mode }       # unknown mode -> safe software default
         }
         $Script:CodecSource = "config: $($Script:Mode)"
     } else {
@@ -834,8 +872,17 @@ function Resolve-Encoder {
         $Script:CodecSource = 'default'
     }
 
+    $supported = @('auto','hw','software','software_x264','libx264','libx265') + $Script:HwHierarchy
+    if ($choice -notin $supported) { throw "Unsupported encoder: $choice" }
+    foreach ($enc in $Script:HardwareOrder) {
+        if ($enc -notin $Script:HwHierarchy) { throw "Unsupported hardware encoder in config: $enc" }
+    }
+    foreach ($enc in $Script:SoftwareOrder) {
+        if ($enc -notin 'libx264','libx265') { throw "Unsupported software encoder in config: $enc" }
+    }
+    if ($choice -eq 'auto') { $choice = 'hw' }
     switch ($choice) {
-        'auto' {
+        'software' {
             $Script:VideoCodec = Get-SoftwareEncoder   # software list via cheap grep
         }
         'software_x264' {
@@ -881,7 +928,7 @@ function Invoke-HwEncode {
         $Mode = 'bitrate'; $Bitrate = [int]$VideoParams.Bitrate; $MaxRate = $Bitrate
     }
 
-    $FFArgs = @("-y", "-i", $InputFile)
+    $FFArgs = @("-nostdin", "-hide_banner", "-y", "-i", $InputFile)
     $FFArgs += $Script:VsyncFlag.Split(' ')
     $FFArgs += "-c:v", $Script:VideoCodec
     $FFArgs += "-pix_fmt", "yuv420p"
@@ -899,7 +946,7 @@ function Invoke-HwEncode {
     $FFArgs += "-movflags", "+faststart"
     $FFArgs += $OutputFile
 
-    & $Script:FFmpeg @FFArgs 2> "$OutputFile.log" | Out-Null
+    & $Script:FFmpeg @FFArgs 2>&1 | ForEach-Object { "$_" } | Out-File -LiteralPath "$OutputFile.log" -Encoding UTF8
     return $LASTEXITCODE
 }
 
@@ -918,14 +965,30 @@ function Invoke-FFmpegEncode {
     # call site working unmodified. The software path below is unchanged.
     if ($Script:CodecFamily -ne 'software') {
         if ($Pass -eq 1) { return 0 }
-        return Invoke-HwEncode -InputFile $InputFile -OutputFile $OutputFile `
+        $hwExit = Invoke-HwEncode -InputFile $InputFile -OutputFile $OutputFile `
             -VideoParams $VideoParams -AudioParams $AudioParams
+        if ($hwExit -eq 0) { return 0 }
+        Write-ColorOutput "  [Encoder] GPU encode failed on this input; retrying with software." 'Yellow'
+        if (Test-Path -LiteralPath "$OutputFile.log") {
+            Copy-Item -LiteralPath "$OutputFile.log" -Destination "$OutputFile.gpu-failed.log" -Force
+        }
+        $Script:VideoCodec = Get-SoftwareEncoder
+        $Script:CodecFamily = 'software'
+        $script:Preset = Resolve-PresetToken -Family 'software' -Preset $Preset
+        $VideoParams.Preset = $script:Preset
+        if ($Pass -eq 2) {
+            $first = Invoke-FFmpegEncode -InputFile $InputFile -OutputFile 'NUL' -VideoParams $VideoParams `
+                -AudioParams @{} -PassLogFile $PassLogFile -Pass 1
+            if ($first -ne 0) { return $first }
+        }
+        return Invoke-FFmpegEncode -InputFile $InputFile -OutputFile $OutputFile -VideoParams $VideoParams `
+            -AudioParams $AudioParams -PassLogFile $PassLogFile -Pass $Pass
     }
     
     # Build a clean argument ARRAY and invoke via the call operator (& exe @args). Each
     # element becomes a single argv entry, so no manual quoting is needed and paths with
     # spaces / & / ( ) are handled correctly.
-    $FFArgs = @("-y", "-i", $InputFile)
+    $FFArgs = @("-nostdin", "-hide_banner", "-y", "-i", $InputFile)
     $FFArgs += $Script:VsyncFlag.Split(' ')
 
     if ($Pass -gt 0) {
@@ -970,7 +1033,7 @@ function Invoke-FFmpegEncode {
     }
 
     # Execute: stderr -> log file, discard stdout, exit code from $LASTEXITCODE.
-    & $Script:FFmpeg @FFArgs 2> $LogPath | Out-Null
+    & $Script:FFmpeg @FFArgs 2>&1 | ForEach-Object { "$_" } | Out-File -LiteralPath $LogPath -Encoding UTF8
     return $LASTEXITCODE
 }
 
@@ -980,18 +1043,26 @@ function Invoke-RescueMode {
         [string]$PartSuffix = ""
     )
     
-    $FileName = [System.IO.Path]::GetFileNameWithoutExtension($InputFile)
-    $OutputFile = Join-Path $Script:OUTPUT_DIR "${FileName}${PartSuffix}_optimized.mp4"
-    $TempFile = Join-Path $Script:OUTPUT_DIR "${FileName}${PartSuffix}_temp_$PID.mp4"
+    $FileName = $Script:BaseName
+    $OutputFile = Join-Path $Script:FINAL_OUTPUT_DIR "${FileName}${PartSuffix}_optimized.mp4"
+    $TempFile = Join-Path $Script:OUTPUT_DIR "encode${PartSuffix}_temp_$PID.mp4"
     $PassLog = Join-Path $Script:OUTPUT_DIR "rescue_pass_$PID"
     
+    $video = & $Script:FFprobe -v error -select_streams v:0 -show_entries stream=codec_type -of default=noprint_wrappers=1:nokey=1 $InputFile 2>$null
+    $Duration = Get-Duration $InputFile
+    if ($video -ne 'video' -or $Duration -le 0) {
+        Record-Summary "$FileName$PartSuffix" (Get-FileSizeMB $InputFile) 'N/A' 'Invalid Input Fail'
+        return $false
+    }
+    $audio = & $Script:FFprobe -v error -select_streams a:0 -show_entries stream=codec_type -of default=noprint_wrappers=1:nokey=1 $InputFile 2>$null
+    $Script:InputHasAudio = $audio -eq 'audio'
     # Get audio normalization filter (two-pass if enabled)
     $AudioFilter = Get-AudioLoudnessFilter $InputFile
     
     Write-ColorOutput "  [Rescue] Bitrate constraints unsatisfiable. Engaging fallback..." "Yellow"
     
     $Duration = Get-Duration $InputFile
-    $TargetSizeBytes = $TargetSizeMB * 1024 * 1024
+    $TargetSizeBytes = $TargetSizeMB * 1000000
     $OverheadBytes = $Script:OVERHEAD_KB * 1024
     
     $EstAudioBytes = Get-AudioBudgetBytes $MinAudioBitrate $Duration
@@ -1010,7 +1081,7 @@ function Invoke-RescueMode {
         
         Show-Progress "Pass 1" "Analyzing" 0
         $ExitCode1 = Invoke-FFmpegEncode -InputFile $InputFile -OutputFile "NUL" `
-            -VideoParams @{ Bitrate=$CurrentVideoKbps; Preset=$Preset; Scale="scale='min(1920,iw)':-2" } `
+            -VideoParams @{ Bitrate=$CurrentVideoKbps; Preset=$Preset; Scale="scale='min(1920,trunc(iw/2)*2)':-2" } `
             -AudioParams @{} -PassLogFile $PassLog -Pass 1
         Show-Progress "Pass 1" "Analyzing" 100
         Write-Host ""
@@ -1018,17 +1089,18 @@ function Invoke-RescueMode {
         if ($ExitCode1 -ne 0) { break }
         
         Show-Progress "Pass 2" "Encoding" 0
-        $ExitCode2 = Invoke-FFmpegEncode -InputFile $InputFile -OutputFile $OutputFile `
-            -VideoParams @{ Bitrate=$CurrentVideoKbps; Preset=$Preset; Scale="scale='min(1920,iw)':-2" } `
+        $ExitCode2 = Invoke-FFmpegEncode -InputFile $InputFile -OutputFile $TempFile `
+            -VideoParams @{ Bitrate=$CurrentVideoKbps; Preset=$Preset; Scale="scale='min(1920,trunc(iw/2)*2)':-2" } `
             -AudioParams @{ Bitrate=$MinAudioBitrate; NormFilter=$AudioFilter } -PassLogFile $PassLog -Pass 2
         Show-Progress "Pass 2" "Encoding" 100
         Write-Host ""
         
         if ($ExitCode2 -ne 0) { break }
         
-        $FinalSize = Get-FileSizeMB $OutputFile
+        $FinalSize = Get-FileSizeMB $TempFile
         
         if ($FinalSize -le $TargetSizeMB -and $FinalSize -gt 0) {
+            Move-Item -LiteralPath $TempFile -Destination $OutputFile -Force -ErrorAction Stop
             Record-Summary $FileName (Get-FileSizeMB $InputFile) $FinalSize "Rescued (1080p)"
             Write-ColorOutput "  [Rescue] Success: $OutputFile (${FinalSize}MB) - Native Resolution" "Green"
             Remove-Item "${PassLog}*" -ErrorAction SilentlyContinue
@@ -1062,7 +1134,7 @@ function Invoke-RescueMode {
         
         Show-Progress "Pass 1" "Analyzing" 0
         $ExitCode1 = Invoke-FFmpegEncode -InputFile $InputFile -OutputFile "NUL" `
-            -VideoParams @{ Bitrate=$CurrentVideoKbps; Preset=$Preset; Scale="scale='min(1280,iw)':-2" } `
+            -VideoParams @{ Bitrate=$CurrentVideoKbps; Preset=$Preset; Scale="scale='min(1280,trunc(iw/2)*2)':-2" } `
             -AudioParams @{} -PassLogFile $PassLog -Pass 1
         Show-Progress "Pass 1" "Analyzing" 100
         Write-Host ""
@@ -1070,17 +1142,18 @@ function Invoke-RescueMode {
         if ($ExitCode1 -ne 0) { break }
         
         Show-Progress "Pass 2" "Encoding" 0
-        $ExitCode2 = Invoke-FFmpegEncode -InputFile $InputFile -OutputFile $OutputFile `
-            -VideoParams @{ Bitrate=$CurrentVideoKbps; Preset=$Preset; Scale="scale='min(1280,iw)':-2" } `
+        $ExitCode2 = Invoke-FFmpegEncode -InputFile $InputFile -OutputFile $TempFile `
+            -VideoParams @{ Bitrate=$CurrentVideoKbps; Preset=$Preset; Scale="scale='min(1280,trunc(iw/2)*2)':-2" } `
             -AudioParams @{ Bitrate=$MinAudioBitrate; NormFilter=$AudioFilter } -PassLogFile $PassLog -Pass 2
         Show-Progress "Pass 2" "Encoding" 100
         Write-Host ""
         
         if ($ExitCode2 -ne 0) { break }
         
-        $FinalSize = Get-FileSizeMB $OutputFile
+        $FinalSize = Get-FileSizeMB $TempFile
         
         if ($FinalSize -le $TargetSizeMB -and $FinalSize -gt 0) {
+            Move-Item -LiteralPath $TempFile -Destination $OutputFile -Force -ErrorAction Stop
             Record-Summary $FileName (Get-FileSizeMB $InputFile) $FinalSize "Rescued (720p)"
             Write-ColorOutput "  [Rescue] Success: $OutputFile (${FinalSize}MB) - Downscaled to 720p" "Green"
             Remove-Item "${PassLog}*" -ErrorAction SilentlyContinue
@@ -1108,15 +1181,15 @@ function Invoke-RescueMode {
 
     Show-Progress "CRF Pass" "Encoding" 0
     $ExitCodeCRF = Invoke-FFmpegEncode -InputFile $InputFile -OutputFile $TempFile `
-        -VideoParams @{ CRF=$Script:CRF_RESCUE_VALUE; MaxRate=$CrfMaxRate; BufSize=$CrfBufSize; Preset=$Preset; Scale="scale='min(1280,iw)':-2" } `
+        -VideoParams @{ CRF=$Script:CRF_RESCUE_VALUE; MaxRate=$CrfMaxRate; BufSize=$CrfBufSize; Preset=$Preset; Scale="scale='min(1280,trunc(iw/2)*2)':-2" } `
         -AudioParams @{ Bitrate=64; NormFilter=$AudioFilter }
     Show-Progress "CRF Pass" "Encoding" 100
     Write-Host ""
     
     $CRFSizeMB = Get-FileSizeMB $TempFile
     
-    if ($CRFSizeMB -le $TargetSizeMB -and $CRFSizeMB -gt 0) {
-        Move-Item $TempFile $OutputFile -Force
+    if ($ExitCodeCRF -eq 0 -and $CRFSizeMB -le $TargetSizeMB -and $CRFSizeMB -gt 0) {
+        Move-Item -LiteralPath $TempFile -Destination $OutputFile -Force -ErrorAction Stop
         Record-Summary $FileName (Get-FileSizeMB $InputFile) $CRFSizeMB "Rescued (CRF)"
         Write-ColorOutput "  [Rescue] Success (CRF): $OutputFile (${CRFSizeMB}MB)" "Green"
         Remove-Item "${PassLog}*" -ErrorAction SilentlyContinue
@@ -1134,7 +1207,7 @@ function Split-VideoAtKeyframe {
         [string]$PartSuffix = ""
     )
     
-    $FileName = [System.IO.Path]::GetFileNameWithoutExtension($InputFile)
+    $FileName = $Script:BaseName
     $Duration = Get-Duration $InputFile
     
     if ($Duration -eq 0) {
@@ -1142,10 +1215,14 @@ function Split-VideoAtKeyframe {
         return $false
     }
     
+    if (($PartSuffix -split '_PART_').Count -gt 8 -or $Duration -lt 1) {
+        Record-Summary "$FileName$PartSuffix" (Get-FileSizeMB $InputFile) 'N/A' 'Split Limit Fail'
+        return $false
+    }
     # Pre-flight check - calculate if mathematically possible
     $AbsoluteMinVideoBytes = $MinVideoBitrate * 1000 * $Duration / 8
     $AbsoluteMinAudioBytes = Get-AudioBudgetBytes $MinAudioBitrate $Duration
-    $AbsoluteMinTotalMB = ($AbsoluteMinVideoBytes + $AbsoluteMinAudioBytes) / 1MB
+    $AbsoluteMinTotalMB = ($AbsoluteMinVideoBytes + $AbsoluteMinAudioBytes) / 1000000.0
     
     # If rescue might work, try that first; fall through to splitting if it fails.
     if ($AbsoluteMinTotalMB -le $TargetSizeMB) {
@@ -1180,21 +1257,21 @@ function Split-VideoAtKeyframe {
     $Args1 = @("-y", "-i", $InputFile, "-t", $SplitPointStr, "-c", "copy", "-avoid_negative_ts", "1", $Part1File)
     $Args2 = @("-y", "-i", $InputFile, "-ss", $SplitPointStr, "-c", "copy", "-avoid_negative_ts", "1", $Part2File)
 
-    & $Script:FFmpeg @Args1 2> "$Part1File.log" | Out-Null
+    & $Script:FFmpeg @Args1 2>&1 | ForEach-Object { "$_" } | Out-File -LiteralPath "$Part1File.log" -Encoding UTF8
     $Exit1 = $LASTEXITCODE
-    & $Script:FFmpeg @Args2 2> "$Part2File.log" | Out-Null
+    & $Script:FFmpeg @Args2 2>&1 | ForEach-Object { "$_" } | Out-File -LiteralPath "$Part2File.log" -Encoding UTF8
     $Exit2 = $LASTEXITCODE
 
     if ($Exit1 -ne 0 -or $Exit2 -ne 0) {
         Write-ColorOutput "  Split failed. Check logs." "Red"
-        Remove-Item $Part1File,$Part2File -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $Part1File,$Part2File -ErrorAction SilentlyContinue
         Record-Summary "$FileName$PartSuffix" (Get-FileSizeMB $InputFile) "N/A" "Split Fail"
         return $false
     }
     
     if ((Get-FileSizeMB $Part1File) -eq 0 -or (Get-FileSizeMB $Part2File) -eq 0) {
         Write-ColorOutput "  Split produced zero-byte artifacts." "Red"
-        Remove-Item $Part1File,$Part2File -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $Part1File,$Part2File -ErrorAction SilentlyContinue
         Record-Summary "$FileName$PartSuffix" (Get-FileSizeMB $InputFile) "N/A" "Split Fail"
         return $false
     }
@@ -1203,7 +1280,7 @@ function Split-VideoAtKeyframe {
     $Result1 = Optimize-Video $Part1File $Part1Suffix
     $Result2 = Optimize-Video $Part2File $Part2Suffix
     
-    Remove-Item $Part1File,$Part2File -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $Part1File,$Part2File -ErrorAction SilentlyContinue
     
     if ($Result1 -and $Result2) {
         Record-Summary "$FileName$PartSuffix" (Get-FileSizeMB $InputFile) "N/A" "Split"
@@ -1219,11 +1296,20 @@ function Optimize-Video {
         [string]$PartSuffix = ""
     )
     
-    $FileName = [System.IO.Path]::GetFileNameWithoutExtension($InputFile)
-    $OutputFile = Join-Path $Script:OUTPUT_DIR "${FileName}${PartSuffix}_optimized.mp4"
-    $TempFile = Join-Path $Script:OUTPUT_DIR "${FileName}${PartSuffix}_temp_$PID.mp4"
+    $FileName = $Script:BaseName
+    $OutputFile = Join-Path $Script:FINAL_OUTPUT_DIR "${FileName}${PartSuffix}_optimized.mp4"
+    $TempFile = Join-Path $Script:OUTPUT_DIR "encode${PartSuffix}_temp_$PID.mp4"
     $PassLog = Join-Path $Script:OUTPUT_DIR "ffmpeg2pass_$PID"
+    if (Test-Path -LiteralPath $OutputFile) { throw "Output already exists: $OutputFile" }
     
+    $video = & $Script:FFprobe -v error -select_streams v:0 -show_entries stream=codec_type -of default=noprint_wrappers=1:nokey=1 $InputFile 2>$null
+    $Duration = Get-Duration $InputFile
+    if ($video -ne 'video' -or $Duration -le 0) {
+        Record-Summary "$FileName$PartSuffix" (Get-FileSizeMB $InputFile) 'N/A' 'Invalid Input Fail'
+        return $false
+    }
+    $audio = & $Script:FFprobe -v error -select_streams a:0 -show_entries stream=codec_type -of default=noprint_wrappers=1:nokey=1 $InputFile 2>$null
+    $Script:InputHasAudio = $audio -eq 'audio'
     # Get audio normalization filter (two-pass if enabled)
     $AudioFilter = Get-AudioLoudnessFilter $InputFile
     
@@ -1237,7 +1323,7 @@ function Optimize-Video {
     
     Write-ColorOutput "Processing: $InputFile (Original: ${OrigSizeMB}MB)" "Cyan"
     
-    if ($OrigSizeMB -lt $Script:MAX_SIZE_MB) {
+    if ($OrigSizeMB -le $Script:MAX_SIZE_MB -and -not $NormalizeAudio -and -not $Mono) {
         # A non-MP4 input that already fits must still be remuxed: a byte copy would hand
         # back a Matroska/WebM stream wearing an .mp4 extension, which Discord will not
         # play inline. If the codecs cannot live in MP4, fall through to a real encode
@@ -1247,22 +1333,23 @@ function Optimize-Video {
         if ($NoAudio) {
             # Honor -NoAudio even on the no-encode fast path: stream-copy video, drop audio
             # (lossless); fall back to a plain copy only when the input is already MP4.
-            & $Script:FFmpeg -y -i $InputFile -c copy -an -movflags +faststart $OutputFile 2>$null | Out-Null
+            & $Script:FFmpeg -y -i $InputFile -c copy -an -movflags +faststart $TempFile 2>$null | Out-Null
             if ($LASTEXITCODE -ne 0) {
-                if ($IsMp4) { Copy-Item $InputFile $OutputFile -Force } else { $FastPathOk = $false }
+                $FastPathOk = $false
             }
         } elseif ($IsMp4) {
-            Copy-Item $InputFile $OutputFile -Force
+            Copy-Item -LiteralPath $InputFile -Destination $TempFile -ErrorAction Stop
         } else {
-            & $Script:FFmpeg -y -i $InputFile -c copy -movflags +faststart $OutputFile 2>$null | Out-Null
+            & $Script:FFmpeg -y -i $InputFile -c copy -movflags +faststart $TempFile 2>$null | Out-Null
             if ($LASTEXITCODE -ne 0) { $FastPathOk = $false }
         }
-        if ($FastPathOk) {
+        if ($FastPathOk -and (Get-FileSizeMB $TempFile) -le $TargetSizeMB -and (Get-FileSizeMB $TempFile) -gt 0) {
+            Move-Item -LiteralPath $TempFile -Destination $OutputFile -ErrorAction Stop
             Record-Summary "$FileName$PartSuffix" $OrigSizeMB (Get-FileSizeMB $OutputFile) "Copied"
             Write-ColorOutput "Copied: $OutputFile" "Green"
             return $true
         }
-        Remove-Item $OutputFile -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $TempFile -Force -ErrorAction SilentlyContinue
         Write-ColorOutput "  [Info] Input fits but cannot be remuxed to MP4 losslessly; re-encoding." "Yellow"
     }
     
@@ -1274,7 +1361,7 @@ function Optimize-Video {
     
     # Bitrate calculation
     $AudioBitrateKbps = $Script:INITIAL_AUDIO_BITRATE_KBPS
-    $TargetSizeBytes = $TargetSizeMB * 1024 * 1024
+    $TargetSizeBytes = $TargetSizeMB * 1000000
     $OverheadBytes = $Script:OVERHEAD_KB * 1024
     
     $EstAudioBytes = Get-AudioBudgetBytes $AudioBitrateKbps $Duration
@@ -1305,7 +1392,7 @@ function Optimize-Video {
         # Pass 1
         Show-Progress "Pass 1" "Analyzing" 0
         $ExitCode1 = Invoke-FFmpegEncode -InputFile $InputFile -OutputFile "NUL" `
-            -VideoParams @{ Bitrate=$CurrentVideoKbps; Preset=$Preset; Scale="scale='min(1920,iw)':-2" } `
+            -VideoParams @{ Bitrate=$CurrentVideoKbps; Preset=$Preset; Scale="scale='min(1920,trunc(iw/2)*2)':-2" } `
             -AudioParams @{} -PassLogFile $PassLog -Pass 1
         Show-Progress "Pass 1" "Analyzing" 100
         Write-Host ""
@@ -1320,7 +1407,7 @@ function Optimize-Video {
         # Pass 2
         Show-Progress "Pass 2" "Encoding" 0
         $ExitCode2 = Invoke-FFmpegEncode -InputFile $InputFile -OutputFile $TempFile `
-            -VideoParams @{ Bitrate=$CurrentVideoKbps; Preset=$Preset; Scale="scale='min(1920,iw)':-2" } `
+            -VideoParams @{ Bitrate=$CurrentVideoKbps; Preset=$Preset; Scale="scale='min(1920,trunc(iw/2)*2)':-2" } `
             -AudioParams @{ Bitrate=$AudioBitrateKbps; NormFilter=$AudioFilter } -PassLogFile $PassLog -Pass 2
         Show-Progress "Pass 2" "Encoding" 100
         Write-Host ""
@@ -1335,8 +1422,8 @@ function Optimize-Video {
         $FinalSizeMB = Get-FileSizeMB $TempFile
         Write-ColorOutput "  Result: ${FinalSizeMB}MB" "Gray"
         
-        if ($FinalSizeMB -le $Script:MAX_SIZE_MB) {
-            Move-Item $TempFile $OutputFile -Force
+        if ($FinalSizeMB -gt 0 -and $FinalSizeMB -le $Script:MAX_SIZE_MB) {
+            Move-Item -LiteralPath $TempFile -Destination $OutputFile -Force -ErrorAction Stop
 
             # Bidirectional convergence: if we landed well under target, reclaim the
             # unused headroom once by re-encoding upward (ABR otherwise only lowers).
@@ -1349,7 +1436,7 @@ function Optimize-Video {
 
                 Show-Progress "Pass 1" "Analyzing" 0
                 $UpExit1 = Invoke-FFmpegEncode -InputFile $InputFile -OutputFile "NUL" `
-                    -VideoParams @{ Bitrate=$UpwardKbps; Preset=$Preset; Scale="scale='min(1920,iw)':-2" } `
+                    -VideoParams @{ Bitrate=$UpwardKbps; Preset=$Preset; Scale="scale='min(1920,trunc(iw/2)*2)':-2" } `
                     -AudioParams @{} -PassLogFile $PassLog -Pass 1
                 Show-Progress "Pass 1" "Analyzing" 100
                 Write-Host ""
@@ -1358,7 +1445,7 @@ function Optimize-Video {
                 if ($UpExit1 -eq 0) {
                     Show-Progress "Pass 2" "Encoding" 0
                     $UpExit2 = Invoke-FFmpegEncode -InputFile $InputFile -OutputFile $TempFile `
-                        -VideoParams @{ Bitrate=$UpwardKbps; Preset=$Preset; Scale="scale='min(1920,iw)':-2" } `
+                        -VideoParams @{ Bitrate=$UpwardKbps; Preset=$Preset; Scale="scale='min(1920,trunc(iw/2)*2)':-2" } `
                         -AudioParams @{ Bitrate=$AudioBitrateKbps; NormFilter=$AudioFilter } -PassLogFile $PassLog -Pass 2
                     Show-Progress "Pass 2" "Encoding" 100
                     Write-Host ""
@@ -1369,16 +1456,16 @@ function Optimize-Video {
                     # Keep the upward result only if it stayed within the hard cap and is
                     # genuinely closer to target (larger) than the result we already have.
                     if ($UpwardSize -le $Script:MAX_SIZE_MB -and $UpwardSize -gt $PrevGoodSize) {
-                        Move-Item $TempFile $OutputFile -Force
+                        Move-Item -LiteralPath $TempFile -Destination $OutputFile -Force -ErrorAction Stop
                         $FinalSizeMB = $UpwardSize
                         Write-ColorOutput "  Headroom reclaimed: ${FinalSizeMB}MB" "Gray"
                     } else {
                         Write-ColorOutput "  Upward retry (${UpwardSize}MB) not usable; keeping ${PrevGoodSize}MB result." "Gray"
-                        Remove-Item $TempFile -ErrorAction SilentlyContinue
+                        Remove-Item -LiteralPath $TempFile -ErrorAction SilentlyContinue
                     }
                 } else {
                     Write-ColorOutput "  Upward retry failed; keeping ${PrevGoodSize}MB result." "Gray"
-                    Remove-Item $TempFile -ErrorAction SilentlyContinue
+                    Remove-Item -LiteralPath $TempFile -ErrorAction SilentlyContinue
                 }
             }
 
@@ -1413,7 +1500,7 @@ function Optimize-Video {
             break
         }
         
-        Remove-Item $TempFile -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $TempFile -ErrorAction SilentlyContinue
     }
     
     # CRF Rescue (capped): CRF rescue quality with a VBV cap so it cannot overshoot the
@@ -1425,15 +1512,15 @@ function Optimize-Video {
 
     Show-Progress "CRF Pass" "Encoding" 0
     $ExitCodeCRF = Invoke-FFmpegEncode -InputFile $InputFile -OutputFile $TempFile `
-        -VideoParams @{ CRF=$Script:CRF_RESCUE_VALUE; MaxRate=$CrfMaxRate; BufSize=$CrfBufSize; Preset=$Preset; Scale="scale='min(1920,iw)':-2" } `
+        -VideoParams @{ CRF=$Script:CRF_RESCUE_VALUE; MaxRate=$CrfMaxRate; BufSize=$CrfBufSize; Preset=$Preset; Scale="scale='min(1920,trunc(iw/2)*2)':-2" } `
         -AudioParams @{ Bitrate=64; NormFilter=$AudioFilter }
     Show-Progress "CRF Pass" "Encoding" 100
     Write-Host ""
     
     $CRFSizeMB = Get-FileSizeMB $TempFile
     
-    if ($CRFSizeMB -le $Script:MAX_SIZE_MB -and $CRFSizeMB -gt 0) {
-        Move-Item $TempFile $OutputFile -Force
+    if ($ExitCodeCRF -eq 0 -and $CRFSizeMB -le $Script:MAX_SIZE_MB -and $CRFSizeMB -gt 0) {
+        Move-Item -LiteralPath $TempFile -Destination $OutputFile -Force -ErrorAction Stop
         Record-Summary "$FileName$PartSuffix" $OrigSizeMB $CRFSizeMB "Rescued (CRF)"
         Write-ColorOutput "Success (CRF Rescue): $OutputFile (${CRFSizeMB}MB)" "Green"
         Remove-Item "${PassLog}*" -ErrorAction SilentlyContinue
@@ -1498,16 +1585,24 @@ if ($OutputDir) {
 } else {
     $Script:OUTPUT_DIR = Join-Path (Get-Location).Path "optimized"
 }
-if ($Script:CfgAudioBitrate) {
+if (-not $PSBoundParameters.ContainsKey('AudioBitrate') -and $Script:CfgAudioBitrate) {
     $parsed = 0
     if ([int]::TryParse($Script:CfgAudioBitrate, [ref]$parsed) -and $parsed -gt 0) { $Script:INITIAL_AUDIO_BITRATE_KBPS = $parsed }
 }
-if ($Script:CfgCrfRescueValue) {
+if (-not $PSBoundParameters.ContainsKey('CrfRescueValue') -and $Script:CfgCrfRescueValue) {
     $parsed = 0
     if ([int]::TryParse($Script:CfgCrfRescueValue, [ref]$parsed) -and $parsed -gt 0) { $Script:CRF_RESCUE_VALUE = $parsed }
 }
 
-$Script:MAX_SIZE_MB = [math]::Ceiling($TargetSizeMB)
+if ([double]::IsNaN($TargetSizeMB) -or [double]::IsInfinity($TargetSizeMB) -or
+    $TargetSizeMB -lt 0.25 -or $TargetSizeMB -gt 100000 -or
+    $MinVideoBitrate -lt 50 -or $MinVideoBitrate -gt 50000 -or
+    $MinAudioBitrate -lt 16 -or $MinAudioBitrate -gt 512 -or
+    $Script:INITIAL_AUDIO_BITRATE_KBPS -lt $MinAudioBitrate -or $Script:INITIAL_AUDIO_BITRATE_KBPS -gt 512 -or
+    $MaxRetries -lt 1 -or $MaxRetries -gt 10 -or $Script:CRF_RESCUE_VALUE -lt 1 -or $Script:CRF_RESCUE_VALUE -gt 51) {
+    throw 'Invalid compression settings. Check target, bitrates, retries and rescue quality.'
+}
+$Script:MAX_SIZE_MB = $TargetSizeMB
 
 # Setup
 if (-not (Test-Path $Script:OUTPUT_DIR)) {
@@ -1518,10 +1613,11 @@ $Script:FFmpeg = Get-FFmpegPath
 $Script:FFprobe = Get-FFprobePath
 
 if (-not $Script:FFprobe) {
-    Write-ColorOutput "WARNING: ffprobe not found. Some features may be limited." "Yellow"
+    Write-ColorOutput "ERROR: ffprobe is required. Install it alongside FFmpeg." "Red"
+    exit 1
 }
 
-# Resolve encoder: -Encoder flag > config mode > built-in software default; probe + route.
+# Resolve encoder: flag > config mode > hardware-first default; probe + route.
 Resolve-Encoder
 
 # Normalize the preset to a token valid for the encoder we landed on (warn once on a
@@ -1558,9 +1654,9 @@ if ($Files.Count -eq 0) {
 # Filter out already-optimized files and expand folders
 $FilesToProcess = @()
 foreach ($File in $Files) {
-    if (Test-Path $File -PathType Container) {
+    if (Test-Path -LiteralPath $File -PathType Container) {
         Write-ColorOutput "Folder detected: $File - Scanning for videos..." "Cyan"
-        $FolderFiles = Get-ChildItem -Path $File -File -Recurse |
+        $FolderFiles = Get-ChildItem -LiteralPath $File -File -Recurse |
             Where-Object { $Script:InputExtensions -contains $_.Extension.ToLower() } |
             Select-Object -ExpandProperty FullName
         foreach ($SubFile in $FolderFiles) {
@@ -1576,11 +1672,28 @@ foreach ($File in $Files) {
 if ($FilesToProcess.Count -eq 0) {
     Write-ColorOutput "No supported video files found to process." "Red"
     Wait-ForExit
-    exit 0
+    exit 1
 }
 
 Write-ColorOutput "Found $($FilesToProcess.Count) file(s) to process." "Green"
 
+$FilesToProcess = @($FilesToProcess | Select-Object -Unique)
+# Avoid silently replacing outputs (including same-name inputs in different folders).
+$reserved = @{}
+foreach ($file in $FilesToProcess) {
+    $name = [IO.Path]::GetFileNameWithoutExtension($file)
+    $dest = Join-Path $Script:OUTPUT_DIR "${name}_optimized.mp4"
+    if ($reserved.ContainsKey($name) -or (Test-Path -LiteralPath $dest)) {
+        throw "Output collision for '$name'. Choose an empty output folder or rename the input."
+    }
+    $reserved[$name] = $true
+}
+$Script:FINAL_OUTPUT_DIR = [IO.Path]::GetFullPath($Script:OUTPUT_DIR)
+$Script:WORK_DIR = Join-Path $Script:FINAL_OUTPUT_DIR ('.shrinkwrap-' + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $Script:WORK_DIR -ErrorAction Stop | Out-Null
+$Script:OUTPUT_DIR = $Script:WORK_DIR
+$Script:SUMMARY_FILE = Join-Path $Script:FINAL_OUTPUT_DIR 'optimization_summary.txt'
+$Failures = 0
 $Total = $FilesToProcess.Count
 $Idx = 0
 $TotalInMB = 0.0
@@ -1589,14 +1702,16 @@ try {
     # Process all files
     foreach ($File in $FilesToProcess) {
         $Idx++
-        if (-not (Test-Path $File)) {
+        if (-not (Test-Path -LiteralPath $File)) {
             Write-ColorOutput "File not found: $File" "Red"
+            $Failures++
             continue
         }
 
         Write-FileHeader $Idx $Total ([System.IO.Path]::GetFileName($File))
         $TotalInMB += [double](Get-FileSizeMB $File)
-        $null = Optimize-Video $File
+        $Script:BaseName = [IO.Path]::GetFileNameWithoutExtension($File)
+        if (-not (Optimize-Video $File)) { $Failures++ }
     }
 
     # Generate Summary Report (text + CSV)
@@ -1638,6 +1753,8 @@ finally {
 }
 
 Write-ColorOutput "`nOptimization complete! Summary in $Script:SUMMARY_FILE" "Green"
-Write-ColorOutput "Optimized files are in: $Script:OUTPUT_DIR" "Cyan"
+Write-ColorOutput "Optimized files are in: $Script:FINAL_OUTPUT_DIR" "Cyan"
 
 Wait-ForExit "`nPress Enter to exit"
+if ($Failures -gt 0) { exit 1 }
+exit 0

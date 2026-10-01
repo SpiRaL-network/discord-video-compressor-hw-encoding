@@ -1,9 +1,15 @@
-<#
+﻿<#
 .SYNOPSIS
     Automatically downloads and extracts FFmpeg for Shrinkwrap
 #>
 
+param([switch]$NonInteractive)
 $ErrorActionPreference = "Stop"
+function Wait-SetupExit {
+    if (-not $NonInteractive -and -not [Console]::IsInputRedirected -and -not [Console]::IsOutputRedirected) {
+        Read-Host 'Press Enter to exit' | Out-Null
+    }
+}
 
 # --- Pinned FFmpeg release (supply-chain integrity) ---
 # We pin a specific, immutable build and verify its SHA-256 before extracting, instead of
@@ -16,8 +22,18 @@ $ExpectedSha256 = "6F58CE889F59C311410F7D2B18895B33C03456463486F3B1EBC93D97A0F54
 # Primary: gyan.dev versioned package. Fallback: GitHub release asset (same immutable build).
 $FFmpegURL       = "https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-$FFmpegVersion-essentials_build.zip"
 $FFmpegGitHubURL = "https://github.com/GyanD/codexffmpeg/releases/download/$FFmpegVersion/ffmpeg-$FFmpegVersion-essentials_build.zip"
-$DownloadPath = Join-Path $PSScriptRoot "ffmpeg-essentials.zip"
-$ExtractPath = Join-Path $PSScriptRoot "ffmpeg-temp"
+$SetupId = [guid]::NewGuid().ToString('N')
+$DownloadPath = Join-Path $PSScriptRoot "ffmpeg-$SetupId.zip"
+$ExtractPath = Join-Path $PSScriptRoot "ffmpeg-temp-$SetupId"
+function Remove-SetupArtifacts {
+    Remove-Item -LiteralPath $DownloadPath -Force -ErrorAction SilentlyContinue
+    $resolved = [IO.Path]::GetFullPath($ExtractPath)
+    $root = [IO.Path]::GetFullPath($PSScriptRoot).TrimEnd('\') + '\'
+    if ($resolved.StartsWith($root, [StringComparison]::OrdinalIgnoreCase) -and
+        [IO.Path]::GetFileName($resolved) -eq "ffmpeg-temp-$SetupId") {
+        Remove-Item -LiteralPath $resolved -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
 
 Write-Host "========================================" -ForegroundColor Cyan
 Write-Host "  Discord Shrinkwrap - Setup Wizard" -ForegroundColor Cyan
@@ -38,7 +54,7 @@ if ((Test-Path (Join-Path $PSScriptRoot "ffmpeg.exe")) -and
     Write-Host "You can now use drag_videos_here.bat or run:" -ForegroundColor White
     Write-Host "  .\shrinkwrap.ps1" -ForegroundColor Yellow
     Write-Host ""
-    Read-Host "Press Enter to exit"
+    Wait-SetupExit
     exit 0
 }
 
@@ -52,7 +68,7 @@ try {
     
     # Try primary source first
     try {
-        if (Get-Command Start-BitsTransfer -ErrorAction SilentlyContinue) {
+        if (-not $NonInteractive -and (Get-Command Start-BitsTransfer -ErrorAction SilentlyContinue)) {
             Start-BitsTransfer -Source $FFmpegURL -Destination $DownloadPath -Description "Downloading FFmpeg"
         } else {
             $ProgressPreference = 'SilentlyContinue'
@@ -63,7 +79,7 @@ try {
         Write-Host "      Primary source failed. Trying GitHub mirror..." -ForegroundColor Yellow
         
         # Fallback to GitHub
-        if (Get-Command Start-BitsTransfer -ErrorAction SilentlyContinue) {
+        if (-not $NonInteractive -and (Get-Command Start-BitsTransfer -ErrorAction SilentlyContinue)) {
             Start-BitsTransfer -Source $FFmpegGitHubURL -Destination $DownloadPath -Description "Downloading FFmpeg from GitHub"
         } else {
             $ProgressPreference = 'SilentlyContinue'
@@ -85,7 +101,7 @@ try {
     Write-Host ""
     Write-Host "Then extract ffmpeg.exe and ffprobe.exe to:" -ForegroundColor Yellow
     Write-Host "  $PSScriptRoot" -ForegroundColor Cyan
-    Read-Host "Press Enter to exit"
+    Wait-SetupExit
     exit 1
 }
 
@@ -98,15 +114,15 @@ try {
         Write-Host "        Expected: $ExpectedSha256" -ForegroundColor Yellow
         Write-Host "        Actual:   $ActualSha256" -ForegroundColor Yellow
         Write-Host "        Aborting and deleting the file for safety." -ForegroundColor Yellow
-        Remove-Item $DownloadPath -Force -ErrorAction SilentlyContinue
-        Read-Host "Press Enter to exit"
+        Remove-SetupArtifacts
+        Wait-SetupExit
         exit 1
     }
     Write-Host "      Checksum verified (FFmpeg $FFmpegVersion)." -ForegroundColor Green
 } catch {
     Write-Host "[ERROR] Could not compute checksum: $_" -ForegroundColor Red
-    Remove-Item $DownloadPath -Force -ErrorAction SilentlyContinue
-    Read-Host "Press Enter to exit"
+    Remove-SetupArtifacts
+    Wait-SetupExit
     exit 1
 }
 
@@ -114,30 +130,10 @@ try {
 try {
     Write-Host "[2/4] Extracting archive..." -ForegroundColor Cyan
     
-    # Remove old extraction directory if it exists
-    if (Test-Path $ExtractPath) {
-        Remove-Item $ExtractPath -Recurse -Force -ErrorAction SilentlyContinue
-    }
-    
-    # Create fresh extraction directory
-    New-Item -ItemType Directory -Path $ExtractPath -Force | Out-Null
-    
-    # Extract with error handling
-    try {
-        Expand-Archive -Path $DownloadPath -DestinationPath $ExtractPath -Force -ErrorAction Stop
-        Write-Host "      Extraction complete!" -ForegroundColor Green
-    } catch {
-        # Try alternative extraction method using Shell.Application COM object
-        Write-Host "      Trying alternative extraction method..." -ForegroundColor Yellow
-        
-        $Shell = New-Object -ComObject Shell.Application
-        $Zip = $Shell.NameSpace($DownloadPath)
-        $Destination = $Shell.NameSpace($ExtractPath)
-        $Destination.CopyHere($Zip.Items(), 16)
-        
-        Write-Host "      Extraction complete!" -ForegroundColor Green
-    }
-    
+    New-Item -ItemType Directory -Path $ExtractPath -ErrorAction Stop | Out-Null
+    Expand-Archive -LiteralPath $DownloadPath -DestinationPath $ExtractPath -ErrorAction Stop
+    Write-Host "      Extraction complete!" -ForegroundColor Green
+
 } catch {
     Write-Host "[ERROR] Extraction failed: $_" -ForegroundColor Red
     Write-Host ""
@@ -149,8 +145,8 @@ try {
     Write-Host "  2. Find ffmpeg.exe and ffprobe.exe in the bin\ folder" -ForegroundColor White
     Write-Host "  3. Copy them to: $PSScriptRoot" -ForegroundColor Cyan
     Write-Host ""
-    Remove-Item $DownloadPath -ErrorAction SilentlyContinue
-    Read-Host "Press Enter to exit"
+    Remove-SetupArtifacts
+    Wait-SetupExit
     exit 1
 }
 
@@ -171,7 +167,7 @@ try {
     }
     
     if (-not $FFprobeExe) {
-        Write-Host "[WARNING] Could not find ffprobe.exe (optional)" -ForegroundColor Yellow
+        throw "ffprobe.exe not found in verified archive"
     }
     
     # Copy files
@@ -197,7 +193,7 @@ try {
     Write-Host "  2. Find ffmpeg.exe and ffprobe.exe" -ForegroundColor White
     Write-Host "  3. Copy them to: $PSScriptRoot" -ForegroundColor Cyan
     Write-Host ""
-    Read-Host "Press Enter to exit"
+    Wait-SetupExit
     exit 1
 }
 
@@ -205,8 +201,7 @@ try {
 try {
     Write-Host "[4/4] Cleaning up temporary files..." -ForegroundColor Cyan
     
-    Remove-Item $DownloadPath -Force -ErrorAction SilentlyContinue
-    Remove-Item $ExtractPath -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-SetupArtifacts
     
     Write-Host "      Cleanup complete!" -ForegroundColor Green
     
@@ -225,4 +220,5 @@ Write-Host "  - Double-click drag_videos_here.bat" -ForegroundColor Cyan
 Write-Host "  - Run .\shrinkwrap.ps1 directly" -ForegroundColor Cyan
 Write-Host ""
 
-Read-Host "Press Enter to exit"
+Wait-SetupExit
+exit 0

@@ -23,7 +23,14 @@ echo.
 :: STEP 1: Check FFmpeg
 :: ====================
 
-if exist "ffmpeg.exe" goto :ffmpeg_found
+if exist "ffmpeg.exe" if exist "ffprobe.exe" goto :ffmpeg_found
+where /q ffmpeg.exe
+if errorlevel 1 goto :setup_offer
+where /q ffprobe.exe
+if errorlevel 1 goto :setup_offer
+goto :ffmpeg_found
+
+:setup_offer
 
 :: FFmpeg not found - offer auto-install
 echo [1/2] FFmpeg not detected - first-time setup required
@@ -57,9 +64,10 @@ if not exist "setup-ffmpeg.ps1" (
 )
 
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "setup-ffmpeg.ps1"
+if errorlevel 1 goto :manual_install
 
 :: Verify installation succeeded
-if not exist "ffmpeg.exe" (
+if not exist "ffprobe.exe" (
     echo.
     echo [ERROR] FFmpeg installation failed.
     echo.
@@ -142,7 +150,14 @@ echo [2/2] Starting video compression...
 echo.
 
 :: Run the PowerShell optimizer with all arguments
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "shrinkwrap.ps1" %*
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "shrinkwrap.ps1" -NonInteractive %*
+set "COMPRESSOR_EXIT=%ERRORLEVEL%"
+if not "%COMPRESSOR_EXIT%"=="0" (
+    echo.
+    echo [ERROR] Compression failed or only partially completed. See the log above.
+    if "%~1"=="" pause
+    exit /b %COMPRESSOR_EXIT%
+)
 
 echo.
 echo ========================================
@@ -154,3 +169,4 @@ echo.
 
 :: Only pause if double-clicked (not drag-and-drop)
 if "%~1"=="" pause
+exit /b %COMPRESSOR_EXIT%
