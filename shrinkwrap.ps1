@@ -55,6 +55,11 @@
 .PARAMETER OutputDir
     Custom output directory for compressed videos. Default: .\optimized
 
+.PARAMETER OutputName
+    Optional output filename or template. Blank uses source_optimized.mp4. Supports
+    {name} and {index}; names in multi-file batches are disambiguated automatically.
+    Existing outputs are preserved; new results get (2), (3), etc.
+
 .PARAMETER Config
     Launch the interactive setup wizard: choose a default encoder, write shrinkwrap.conf,
     then exit without processing any files. Re-run anytime to reconfigure. Requires an
@@ -112,6 +117,7 @@ param(
     [ValidateRange(1, 51)][int]$CrfRescueValue = 28,
     [ValidateRange(1, 10)][int]$MaxRetries = 3,
     [string]$OutputDir = $null,
+    [string]$OutputName = $null,
     [switch]$NoCleanup,
     [switch]$NormalizeAudio,
     [switch]$Mono,
@@ -705,7 +711,7 @@ function Read-Config {
     $Script:CfgNormalizeAudio = $null; $Script:CfgMono = $null; $Script:CfgNoAudio = $null
     $Script:CfgAudioBitrate = $null; $Script:CfgMinAudioBitrate = $null
     $Script:CfgMinVideoBitrate = $null; $Script:CfgMaxRetries = $null
-    $Script:CfgCrfRescueValue = $null; $Script:CfgOutputDir = $null; $Script:CfgNoCleanup = $null
+    $Script:CfgCrfRescueValue = $null; $Script:CfgOutputDir = $null; $Script:CfgNoCleanup = $null; $Script:CfgOutputName = $null
     $Script:ConfigFound = $false
     $path = Get-ConfigReadPath
     if ($path) {
@@ -732,6 +738,7 @@ function Read-Config {
                 'max_retries'       { $Script:CfgMaxRetries        = $value }
                 'crf_rescue_value'  { $Script:CfgCrfRescueValue    = $value }
                 'output_dir'        { $Script:CfgOutputDir         = $value }
+                'output_name'       { $Script:CfgOutputName        = $value }
                 'no_cleanup'        { $Script:CfgNoCleanup         = $value }
             }
         }
@@ -800,6 +807,7 @@ min_audio_bitrate = $minAudBitrate
 # crf_rescue_value: CRF quality value for Phase 3 rescue pass (default: 28)
 # no_cleanup: preserve logs and intermediate pass files (true/false, default: false)
 output_dir = $outDir
+output_name = $($Script:CfgOutputName)
 min_video_bitrate = $minVidBitrate
 max_retries = $retries
 crf_rescue_value = $crfRescue
@@ -1044,7 +1052,7 @@ function Invoke-RescueMode {
     )
     
     $FileName = $Script:BaseName
-    $OutputFile = Join-Path $Script:FINAL_OUTPUT_DIR "${FileName}${PartSuffix}_optimized.mp4"
+    $OutputFile = Get-OutputFile -PartSuffix $PartSuffix
     $TempFile = Join-Path $Script:OUTPUT_DIR "encode${PartSuffix}_temp_$PID.mp4"
     $PassLog = Join-Path $Script:OUTPUT_DIR "rescue_pass_$PID"
     
@@ -1100,7 +1108,7 @@ function Invoke-RescueMode {
         $FinalSize = Get-FileSizeMB $TempFile
         
         if ($FinalSize -le $TargetSizeMB -and $FinalSize -gt 0) {
-            Move-Item -LiteralPath $TempFile -Destination $OutputFile -Force -ErrorAction Stop
+            Move-Item -LiteralPath $TempFile -Destination $OutputFile -ErrorAction Stop
             Record-Summary $FileName (Get-FileSizeMB $InputFile) $FinalSize "Rescued (1080p)"
             Write-ColorOutput "  [Rescue] Success: $OutputFile (${FinalSize}MB) - Native Resolution" "Green"
             Remove-Item "${PassLog}*" -ErrorAction SilentlyContinue
@@ -1153,7 +1161,7 @@ function Invoke-RescueMode {
         $FinalSize = Get-FileSizeMB $TempFile
         
         if ($FinalSize -le $TargetSizeMB -and $FinalSize -gt 0) {
-            Move-Item -LiteralPath $TempFile -Destination $OutputFile -Force -ErrorAction Stop
+            Move-Item -LiteralPath $TempFile -Destination $OutputFile -ErrorAction Stop
             Record-Summary $FileName (Get-FileSizeMB $InputFile) $FinalSize "Rescued (720p)"
             Write-ColorOutput "  [Rescue] Success: $OutputFile (${FinalSize}MB) - Downscaled to 720p" "Green"
             Remove-Item "${PassLog}*" -ErrorAction SilentlyContinue
@@ -1189,7 +1197,7 @@ function Invoke-RescueMode {
     $CRFSizeMB = Get-FileSizeMB $TempFile
     
     if ($ExitCodeCRF -eq 0 -and $CRFSizeMB -le $TargetSizeMB -and $CRFSizeMB -gt 0) {
-        Move-Item -LiteralPath $TempFile -Destination $OutputFile -Force -ErrorAction Stop
+        Move-Item -LiteralPath $TempFile -Destination $OutputFile -ErrorAction Stop
         Record-Summary $FileName (Get-FileSizeMB $InputFile) $CRFSizeMB "Rescued (CRF)"
         Write-ColorOutput "  [Rescue] Success (CRF): $OutputFile (${CRFSizeMB}MB)" "Green"
         Remove-Item "${PassLog}*" -ErrorAction SilentlyContinue
@@ -1290,6 +1298,34 @@ function Split-VideoAtKeyframe {
     return $false
 }
 
+# Preserve old results. The reservation table also disambiguates same-name batch inputs.
+function Get-UniqueOutputStem {
+    param([string]$Stem, [string]$Directory)
+    $candidate = $Stem
+    $number = 2
+    while ((Test-Path -LiteralPath (Join-Path $Directory ($candidate + '.mp4'))) -or
+        $Script:ReservedOutputs.ContainsKey((Join-Path $Directory ($candidate + '.mp4')))) {
+        if ($Stem.EndsWith('_optimized')) {
+            $candidate = $Stem.Substring(0, $Stem.Length - 10) + " ($number)_optimized"
+        } else { $candidate = "$Stem ($number)" }
+        $number++
+    }
+    $Script:ReservedOutputs[(Join-Path $Directory ($candidate + '.mp4'))] = $true
+    return $candidate
+}
+
+function Get-OutputFile {
+    param([string]$PartSuffix = '')
+    if ($Script:AssignedOutputs.ContainsKey($PartSuffix)) { return $Script:AssignedOutputs[$PartSuffix] }
+    if ($Script:OutputStem.EndsWith('_optimized')) {
+        $stem = $Script:OutputStem.Substring(0, $Script:OutputStem.Length - 10) + $PartSuffix + '_optimized'
+    } else { $stem = $Script:OutputStem + $PartSuffix }
+    $unique = Get-UniqueOutputStem -Stem $stem -Directory $Script:FINAL_OUTPUT_DIR
+    $path = Join-Path $Script:FINAL_OUTPUT_DIR ($unique + '.mp4')
+    $Script:AssignedOutputs[$PartSuffix] = $path
+    return $path
+}
+
 function Optimize-Video {
     param(
         [string]$InputFile,
@@ -1297,7 +1333,7 @@ function Optimize-Video {
     )
     
     $FileName = $Script:BaseName
-    $OutputFile = Join-Path $Script:FINAL_OUTPUT_DIR "${FileName}${PartSuffix}_optimized.mp4"
+    $OutputFile = Get-OutputFile -PartSuffix $PartSuffix
     $TempFile = Join-Path $Script:OUTPUT_DIR "encode${PartSuffix}_temp_$PID.mp4"
     $PassLog = Join-Path $Script:OUTPUT_DIR "ffmpeg2pass_$PID"
     if (Test-Path -LiteralPath $OutputFile) { throw "Output already exists: $OutputFile" }
@@ -1423,7 +1459,7 @@ function Optimize-Video {
         Write-ColorOutput "  Result: ${FinalSizeMB}MB" "Gray"
         
         if ($FinalSizeMB -gt 0 -and $FinalSizeMB -le $Script:MAX_SIZE_MB) {
-            Move-Item -LiteralPath $TempFile -Destination $OutputFile -Force -ErrorAction Stop
+            Move-Item -LiteralPath $TempFile -Destination $OutputFile -ErrorAction Stop
 
             # Bidirectional convergence: if we landed well under target, reclaim the
             # unused headroom once by re-encoding upward (ABR otherwise only lowers).
@@ -1520,7 +1556,7 @@ function Optimize-Video {
     $CRFSizeMB = Get-FileSizeMB $TempFile
     
     if ($ExitCodeCRF -eq 0 -and $CRFSizeMB -le $Script:MAX_SIZE_MB -and $CRFSizeMB -gt 0) {
-        Move-Item -LiteralPath $TempFile -Destination $OutputFile -Force -ErrorAction Stop
+        Move-Item -LiteralPath $TempFile -Destination $OutputFile -ErrorAction Stop
         Record-Summary "$FileName$PartSuffix" $OrigSizeMB $CRFSizeMB "Rescued (CRF)"
         Write-ColorOutput "Success (CRF Rescue): $OutputFile (${CRFSizeMB}MB)" "Green"
         Remove-Item "${PassLog}*" -ErrorAction SilentlyContinue
@@ -1602,6 +1638,13 @@ if ([double]::IsNaN($TargetSizeMB) -or [double]::IsInfinity($TargetSizeMB) -or
     $MaxRetries -lt 1 -or $MaxRetries -gt 10 -or $Script:CRF_RESCUE_VALUE -lt 1 -or $Script:CRF_RESCUE_VALUE -gt 51) {
     throw 'Invalid compression settings. Check target, bitrates, retries and rescue quality.'
 }
+if (-not $PSBoundParameters.ContainsKey('OutputName') -and $Script:CfgOutputName) {
+    $OutputName = $Script:CfgOutputName
+}
+$templateRemaining = ([string]$OutputName).Replace('{name}','').Replace('{index}','')
+if ($OutputName -match '[<>:"/\\|?*\x00-\x1f]' -or $templateRemaining.Contains('{') -or $templateRemaining.Contains('}')) {
+    throw 'Output name must be a filename, with optional {name} and {index} placeholders.'
+}
 $Script:MAX_SIZE_MB = $TargetSizeMB
 
 # Setup
@@ -1656,11 +1699,14 @@ $FilesToProcess = @()
 foreach ($File in $Files) {
     if (Test-Path -LiteralPath $File -PathType Container) {
         Write-ColorOutput "Folder detected: $File - Scanning for videos..." "Cyan"
+        $outputPrefix = [IO.Path]::GetFullPath($Script:OUTPUT_DIR).TrimEnd('\') + '\'
+        $sameFolder = [IO.Path]::GetFullPath($File).TrimEnd('\') -eq $outputPrefix.TrimEnd('\')
         $FolderFiles = Get-ChildItem -LiteralPath $File -File -Recurse |
             Where-Object { $Script:InputExtensions -contains $_.Extension.ToLower() } |
             Select-Object -ExpandProperty FullName
         foreach ($SubFile in $FolderFiles) {
-            if ($SubFile -notmatch "_optimized\.mp4$") {
+            if ($SubFile -notmatch "_optimized\.mp4$" -and
+                ($sameFolder -or -not $SubFile.StartsWith($outputPrefix, [StringComparison]::OrdinalIgnoreCase))) {
                 $FilesToProcess += $SubFile
             }
         }
@@ -1678,15 +1724,26 @@ if ($FilesToProcess.Count -eq 0) {
 Write-ColorOutput "Found $($FilesToProcess.Count) file(s) to process." "Green"
 
 $FilesToProcess = @($FilesToProcess | Select-Object -Unique)
-# Avoid silently replacing outputs (including same-name inputs in different folders).
-$reserved = @{}
+# Resolve names before encoding. Existing files and duplicate basenames get a suffix.
+$Script:OUTPUT_DIR = [IO.Path]::GetFullPath($Script:OUTPUT_DIR)
+$Script:ReservedOutputs = @{}
+$Script:OutputPlan = @{}
+$planIndex = 0
 foreach ($file in $FilesToProcess) {
-    $name = [IO.Path]::GetFileNameWithoutExtension($file)
-    $dest = Join-Path $Script:OUTPUT_DIR "${name}_optimized.mp4"
-    if ($reserved.ContainsKey($name) -or (Test-Path -LiteralPath $dest)) {
-        throw "Output collision for '$name'. Choose an empty output folder or rename the input."
+    $planIndex++
+    $sourceName = [IO.Path]::GetFileNameWithoutExtension($file)
+    if ([string]::IsNullOrWhiteSpace($OutputName)) {
+        $stem = "${sourceName}_optimized"
+    } else {
+        $stem = $OutputName.Trim() -replace '(?i)\.mp4$', ''
+        $hasPlaceholder = $stem.Contains('{name}') -or $stem.Contains('{index}')
+        $stem = $stem.Replace('{index}', ('{0:000}' -f $planIndex)).Replace('{name}', $sourceName)
+        if ($FilesToProcess.Count -gt 1 -and -not $hasPlaceholder) { $stem += '_{0:000}' -f $planIndex }
     }
-    $reserved[$name] = $true
+    if ([string]::IsNullOrWhiteSpace($stem) -or $stem -match '[<>:"/\\|?*\x00-\x1f]' -or
+        $stem -match '[. ]$' -or $stem -match '^(?i:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)' -or
+        $stem.Length -gt 200) { throw "Invalid output filename: $stem" }
+    $Script:OutputPlan[$file] = Get-UniqueOutputStem -Stem $stem -Directory $Script:OUTPUT_DIR
 }
 $Script:FINAL_OUTPUT_DIR = [IO.Path]::GetFullPath($Script:OUTPUT_DIR)
 $Script:WORK_DIR = Join-Path $Script:FINAL_OUTPUT_DIR ('.shrinkwrap-' + [guid]::NewGuid().ToString('N'))
@@ -1711,6 +1768,9 @@ try {
         Write-FileHeader $Idx $Total ([System.IO.Path]::GetFileName($File))
         $TotalInMB += [double](Get-FileSizeMB $File)
         $Script:BaseName = [IO.Path]::GetFileNameWithoutExtension($File)
+        $Script:OutputStem = $Script:OutputPlan[$File]
+        $Script:AssignedOutputs = @{ '' = (Join-Path $Script:FINAL_OUTPUT_DIR ($Script:OutputStem + '.mp4')) }
+        Write-ColorOutput "Output: $($Script:AssignedOutputs[''])" 'Gray'
         if (-not (Optimize-Video $File)) { $Failures++ }
     }
 

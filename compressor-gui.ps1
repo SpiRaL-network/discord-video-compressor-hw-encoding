@@ -17,8 +17,8 @@ $settings = Read-Preferences $script:PreferencePath
 $schema = @(Get-SettingsSchema)
 $form = New-Object Windows.Forms.Form
 $form.Text = 'Discord Video Compressor | Hardware Encoding'
-$form.Size = New-Object Drawing.Size(980, 860)
-$form.MinimumSize = New-Object Drawing.Size(820, 740)
+$form.Size = New-Object Drawing.Size(1100, 900)
+$form.MinimumSize = New-Object Drawing.Size(820, 780)
 $form.StartPosition = 'CenterScreen'
 $form.Font = New-Object Drawing.Font('Segoe UI', 10)
 $form.AutoScaleMode = 'Dpi'
@@ -31,7 +31,7 @@ $layout.Dock = 'Fill'
 $layout.Padding = New-Object Windows.Forms.Padding(20)
 $layout.ColumnCount = 1
 $layout.RowCount = 7
-foreach ($height in @(62,150,40,310,44,0,35)) {
+foreach ($height in @(62,150,40,350,44,0,35)) {
     $style = New-Object Windows.Forms.RowStyle
     if ($height -eq 0) { $style.SizeType='Percent'; $style.Height=100 } else { $style.SizeType='Absolute'; $style.Height=$height }
     $layout.RowStyles.Add($style) | Out-Null
@@ -51,8 +51,16 @@ function Add-InputPaths {
     param([string[]]$Paths)
     foreach ($path in $Paths) {
         if (Test-Path -LiteralPath $path -PathType Container) {
+            $outputPrefix=$null
+            if ($script:Fields.ContainsKey('output_dir') -and $script:Fields.output_dir.Text) {
+                $output=$script:Fields.output_dir.Text
+                if (-not [IO.Path]::IsPathRooted($output)) { $output=Join-Path $PSScriptRoot $output }
+                $output=[IO.Path]::GetFullPath($output).TrimEnd('\')
+                if ($output -ne [IO.Path]::GetFullPath($path).TrimEnd('\')) { $outputPrefix=$output+'\' }
+            }
             Add-InputPaths @(Get-ChildItem -LiteralPath $path -File -Recurse |
-                Where-Object { $_.Extension.ToLowerInvariant() -in '.mp4','.mkv','.mov','.avi','.webm','.m4v','.flv' -and $_.Name -notmatch '_optimized\.mp4$' } |
+                Where-Object { $_.Extension.ToLowerInvariant() -in '.mp4','.mkv','.mov','.avi','.webm','.m4v','.flv' -and $_.Name -notmatch '_optimized\.mp4$' -and
+                    (-not $outputPrefix -or -not $_.FullName.StartsWith($outputPrefix,[StringComparison]::OrdinalIgnoreCase)) } |
                 Select-Object -ExpandProperty FullName)
         } elseif ((Test-Path -LiteralPath $path -PathType Leaf) -and [IO.Path]::GetExtension($path).ToLowerInvariant() -in '.mp4','.mkv','.mov','.avi','.webm','.m4v','.flv') {
             $full = [IO.Path]::GetFullPath($path)
@@ -107,7 +115,7 @@ $basic = New-SettingsPage 'Compression'
 $advanced = New-SettingsPage 'Advanced'
 $rows = @{Compression=0;Advanced=0}
 foreach ($item in $schema) {
-    $isBasic = $item.Key -in 'mode','target_size_mb','preset','output_dir','normalize_audio','mono','no_audio'
+    $isBasic = $item.Key -in 'mode','target_size_mb','preset','output_dir','output_name','normalize_audio','mono','no_audio'
     $table = if ($isBasic) { $basic } else { $advanced }
     $pageName = if ($isBasic) { 'Compression' } else { 'Advanced' }
     $row = $rows[$pageName]; $rows[$pageName]++
@@ -119,18 +127,30 @@ foreach ($item in $schema) {
     if ($item.Kind -eq 'bool') {
         $field = New-Object Windows.Forms.CheckBox
         $field.Checked=$settings[$item.Key] -eq 'true'; $field.Anchor='Left'
-    } elseif ($item.Kind -in 'encoder','preset') {
+    } elseif ($item.Kind -in 'encoder','preset','quality') {
         $field = New-Object Windows.Forms.ComboBox
-        $field.DropDownStyle='DropDownList'; $field.Dock='Fill'
-        $choices = if ($item.Kind -eq 'encoder') { @(Get-EncoderNames) } else { @('slow','medium','fast','ultrafast','superfast','veryfast','faster','slower','veryslow','placebo','quality','balanced','speed','p1','p2','p3','p4','p5','p6','p7') }
+        $field.DropDownStyle=if ($item.Kind -eq 'quality') { 'DropDown' } else { 'DropDownList' }
+        $field.Dock='Fill'; $field.DisplayMember='Label'; $field.DropDownWidth=820
+        $choices = if ($item.Kind -eq 'encoder') { @(Get-EncoderOptions) } elseif ($item.Kind -eq 'preset') { @(Get-PresetOptions) } else { @(Get-QualityOptions) }
+        if ($item.Kind -eq 'quality' -and $settings[$item.Key] -notin @($choices.Value)) {
+            $choices += [pscustomobject]@{Value=$settings[$item.Key];Label="$($settings[$item.Key]) (custom)"}
+        }
         $field.Items.AddRange([object[]]$choices)
-        $field.SelectedItem=$settings[$item.Key]
+        $field.SelectedItem=@($choices | Where-Object Value -eq $settings[$item.Key] | Select-Object -First 1)[0]
         if ($field.SelectedIndex -lt 0) { $field.SelectedIndex=0 }
+    } elseif ($item.Kind -eq 'integer') {
+        $field=New-Object Windows.Forms.NumericUpDown
+        $field.Minimum=$item.Min; $field.Maximum=$item.Max; $field.Increment=1; $field.DecimalPlaces=0
+        $field.Dock='Fill'
+        $number=0
+        if (-not [int]::TryParse($settings[$item.Key], [ref]$number)) { $number=[int]$item.Default }
+        $field.Value=[math]::Max($item.Min,[math]::Min($item.Max,$number))
     } else {
         $field = New-Object Windows.Forms.TextBox
         $field.Text=$settings[$item.Key]; $field.Dock='Fill'
     }
     $script:Fields[$item.Key]=$field
+    $field.Name=$item.Key
     $tip.SetToolTip($label,$item.Tip); $tip.SetToolTip($field,$item.Tip)
     $table.Controls.Add($field,1,$row)
 }
@@ -160,13 +180,7 @@ $status.AutoSize=$true; $status.Text='Ready'; $statusRow.Controls.Add($status)
 $timer = New-Object Windows.Forms.Timer
 $timer.Interval=150
 function Get-FormSettings {
-    $values = [ordered]@{}
-    foreach ($item in $schema) {
-        $field=$script:Fields[$item.Key]
-        $values[$item.Key] = if ($item.Kind -eq 'bool') { $field.Checked.ToString().ToLowerInvariant() } else { $field.Text.Trim() }
-    }
-    Test-Preferences $values
-    return $values
+    return (Get-ControlPreferences -Fields $script:Fields)
 }
 function Set-RunningState {
     param([bool]$Running)
@@ -247,5 +261,5 @@ $form.Add_FormClosing({
     if ($script:Run) { $script:Run.Worker.Cancel(); Close-CompressorWorker $script:Run; $script:Run=$null }
     $timer.Stop(); $timer.Dispose(); $tip.Dispose()
 })
-if ($TestMode) { return $form }
+if ($TestMode) { $form.Tag=$script:Fields; return $form }
 try { [Windows.Forms.Application]::Run($form) } finally { $form.Dispose() }

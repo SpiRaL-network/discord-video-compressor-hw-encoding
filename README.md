@@ -5,7 +5,7 @@ A small, local video compressor for Discord, with **GPU encoding by default** an
 Thank you, Nuno, for the original constraint-based pipeline, encoder probes and cross-platform scripts.
 This fork and its changes remain **MIT licensed**, with the original copyright retained.
 
-[Guide en français](README.fr.md) · [Audit and testing](AUDIT.md)
+[Guide en français](README.fr.md) · [Changelog](CHANGELOG.md) · [Audit and testing](AUDIT.md)
 
 ## What changed from upstream
 
@@ -18,27 +18,33 @@ This fork and its changes remain **MIT licensed**, with the original copyright r
 - `open_compressor.bat` opens a Windows GUI: video/folder selection, drag-and-drop,
   encoder and preset selection, size cap, audio controls, advanced settings, saved
   defaults, live stage/batch logs, cancellation, output-folder access and verified FFmpeg setup.
+- **Output name** lets you name the result without renaming the source. Encoder menus
+  explain the hardware vendor, codec and tradeoffs; preset and rescue-quality menus
+  include guidance. Audio bitrates accept any integer in the supported range.
 - File sizes use **decimal MB (1 MB = 1,000,000 bytes)** and the exact requested cap.
   The upstream rounded-up acceptance threshold is removed. A `19.8` target means at
   most `19,800,000` bytes, including the container and audio.
 - Audio controls also apply to clips already below the cap. Failed audio removal never
   silently copies the original audio back. Under-cap non-MP4 inputs are remuxed and rechecked.
 - Temporary files are isolated per run. Cleanup only deletes that run's scratch folder.
-  Existing outputs and duplicate input basenames are rejected before compression.
+  Existing outputs stay intact; new results and duplicate input basenames are numbered automatically.
 - Corrupt/audio-only input is rejected, odd video widths are made encoder-safe, splitting
   is bounded, and failed batches return a nonzero exit code. Automated Windows/Linux
   regression tests accompany these changes.
 
 ## Windows quick start
 
-1. Download this fork using **Code → Download ZIP**, then extract the whole folder.
+1. Download the portable ZIP from [Releases](https://github.com/SpiRaL-network/discord-video-compressor-hw-encoding/releases/latest),
+   or use **Code → Download ZIP**, then extract the whole folder.
 2. Double-click **`open_compressor.bat`**.
 3. If FFmpeg is missing, click **Install FFmpeg**. The download is pinned to a release
    and verified with SHA-256 before extraction. You can instead put `ffmpeg.exe` and
    `ffprobe.exe` beside the scripts, or provide both on `PATH`.
 4. Add videos or folders, or drag them into the list. Keep `Encoder = auto` for GPU selection.
-5. Set your upload cap and click **Compress videos**. Results and summary reports go
+5. Set your upload cap and optionally **Output name**, then click **Compress videos**. Results and summary reports go
    to `optimized` by default. Click **Open output** to find them.
+
+![Windows GUI with encoder guidance and a custom output name field](docs/gui.png)
 
 Requires Windows 10/11 and **Windows PowerShell 5.1 / .NET Framework** (included with
 Windows). No Python, Node, web server, account or upload is involved. The GUI is Windows
@@ -80,6 +86,31 @@ x264/QSV presets are accepted. NVENC uses capped VBR with internal multipass;
 AMF/QSV/VideoToolbox use their supported rate-control settings. Every final file is
 size-checked: rate-control flags alone are not a size guarantee.
 
+## Naming outputs and choosing quality
+
+Leave **Output name** blank for `clip_optimized.mp4`, or enter `My Discord clip`
+(the `.mp4` extension is optional). Existing videos are preserved: another run creates
+`My Discord clip (2).mp4`, then `(3)`, and so on. Duplicate source names in a batch
+also get distinct outputs. Inputs are never renamed or modified.
+
+For batches, use `{name}` for the source basename and `{index}` for `001`, `002`, etc.
+For example, `Discord {name} {index}` produces `Discord clip 001.mp4`. A constant
+name such as `Highlights` becomes `Highlights_001.mp4`, `Highlights_002.mp4`.
+Split clips add `_PART_…` to the chosen name. The output name is a filename;
+choose its directory separately with **Output folder**.
+
+The encoder dropdown shows vendor/CPU, codec, compression efficiency and playback
+tradeoffs in parentheses. **Speed / quality** describes the preset's speed/quality
+tradeoff. **Rescue quality (CRF / CQ)** offers suggested values and accepts custom
+integers from 1 to 51: lower values preserve more detail but can need more space.
+It controls the fallback encoding stage, not the resolution. Resolution adjustment
+remains automatic when needed to fit the cap.
+
+AAC audio bitrates are targets, not a fixed list of modes: `124` and `127` kbps are
+valid. The GUI provides integer controls from 16 to 512 kbps for initial and minimum
+audio bitrate; the initial value must be at least the minimum. Video bitrate is
+calculated automatically; its minimum is also an integer control.
+
 ## Command line
 
 ```powershell
@@ -90,6 +121,7 @@ size-checked: rate-control flags alone are not a size guarantee.
 .\shrinkwrap.ps1 -NormalizeAudio -Mono -Files "clip.mp4"
 .\shrinkwrap.ps1 -NoAudio -Files "clip.mp4"
 .\shrinkwrap.ps1 -TargetSizeMB 49 -OutputDir "output-new" -Files "clip.mp4"
+.\shrinkwrap.ps1 -OutputName "My Discord clip.mp4" -Files "clip.mp4"
 ```
 
 ```bash
@@ -100,6 +132,7 @@ bash shrinkwrap.sh -c software -p fast clip.mp4
 bash shrinkwrap.sh -l -m clip.mp4
 bash shrinkwrap.sh -A clip.mp4
 bash shrinkwrap.sh -t 49 -o output-new clip.mp4
+bash shrinkwrap.sh -N 'Discord {name} {index}' clip.mp4
 ```
 
 Linux: install `ffmpeg bc gawk` through your distribution's package manager.
@@ -122,6 +155,7 @@ folders recursively. Already generated `_optimized.mp4` files are skipped.
 | Mono | `-Mono` | `-m` | off |
 | Remove audio | `-NoAudio` | `-A` | off |
 | Output folder | `-OutputDir` | `-o` | `optimized` |
+| Output name / template | `-OutputName` | `-N` | source name + `_optimized` |
 | Keep scratch/logs | `-NoCleanup` | `-n` | off |
 | Save encoder preference wizard | `-Config` | `--config` | explicit only |
 | Disable terminal pause | `-NonInteractive` | automatic | off |
@@ -161,6 +195,7 @@ min_video_bitrate = 500
 max_retries = 3
 crf_rescue_value = 28
 output_dir = optimized
+output_name =
 no_cleanup = false
 ```
 
@@ -170,8 +205,8 @@ compression that is already running. No preference text is executed as code.
 
 ## Troubleshooting and limits
 
-- **Existing output / duplicate basename:** choose an empty output folder or rename
-  the inputs. Re-running does not replace previous compressed videos.
+- **Existing output / duplicate basename:** new outputs are numbered automatically.
+  Use **Output name** to customize them; previous videos remain intact.
 - **GPU unavailable:** check the selected encoder in the log; a GPU driver and a
   compatible FFmpeg build are required. Software fallback is automatic.
 - **Failed clip:** the batch reports failures and returns exit code `1`. Other completed
@@ -198,7 +233,8 @@ bash -n shrinkwrap.sh
 bash tests/linux.sh
 ```
 
-Tests use generated clips and verify actual output bytes, codecs/audio, splitting,
+Tests use generated clips and verify actual output bytes, codecs/audio, custom names,
+collision numbering, batch templates, splitting,
 invalid input, output protection, preferences, the Windows GUI worker and cancellation.
 GitHub Actions runs the Windows PowerShell 5.1 and Ubuntu suites on pushes and pull requests.
 GPU tests use software fallback on machines without suitable hardware; they are not a

@@ -9,14 +9,15 @@ function Get-SettingsSchema {
         @{Key='target_size_mb'; Label='Size limit (MB)'; Default='19.8'; Kind='number'; Min=0.25; Max=100000; Tip='Decimal MB (1,000,000 bytes). Every completed output must fit this cap.'}
         @{Key='preset'; Label='Speed / quality'; Default='slow'; Kind='preset'; Tip='Slow favors quality; fast favors speed. Presets map to the selected GPU vendor.'}
         @{Key='output_dir'; Label='Output folder'; Default='optimized'; Kind='path'; Tip='Existing videos are never replaced. Relative paths use the application folder.'}
+        @{Key='output_name'; Label='Output name (optional)'; Default=''; Kind='filename'; Tip='Blank: original_optimized.mp4. Custom: My clip.mp4. Batch templates: {name} and {index}. Existing outputs stay intact; new versions get (2), (3), etc.'}
         @{Key='normalize_audio'; Label='Normalize loudness (-16 LUFS)'; Default='false'; Kind='bool'; Tip='Two-pass loudness measurement adds processing time.'}
         @{Key='mono'; Label='Downmix to mono'; Default='false'; Kind='bool'; Tip='Useful for voice clips. Keeps more of the size budget for video.'}
         @{Key='no_audio'; Label='Remove audio'; Default='false'; Kind='bool'; Tip='Overrides normalization and mono.'}
-        @{Key='audio_bitrate'; Label='Initial audio bitrate (kbps)'; Default='192'; Kind='integer'; Min=16; Max=512; Tip='Starting AAC bitrate.'}
-        @{Key='min_audio_bitrate'; Label='Minimum audio bitrate (kbps)'; Default='64'; Kind='integer'; Min=16; Max=512; Tip='Audio bitrate floor during retries.'}
+        @{Key='audio_bitrate'; Label='Initial audio bitrate (kbps)'; Default='192'; Kind='integer'; Min=16; Max=512; Tip='Starting AAC bitrate. Any whole value in this range is accepted, including 124 or 127. 64 suits voice; 128-192 suits most clips.'}
+        @{Key='min_audio_bitrate'; Label='Minimum audio bitrate (kbps)'; Default='64'; Kind='integer'; Min=16; Max=512; Tip='AAC bitrate floor during retries. Any whole value in this range is accepted. Lower values leave more room for video.'}
         @{Key='min_video_bitrate'; Label='Minimum video bitrate (kbps)'; Default='500'; Kind='integer'; Min=50; Max=50000; Tip='Bitrate floor before downscaling or splitting. Video bitrate is calculated from duration and size.'}
         @{Key='max_retries'; Label='Retries per resolution'; Default='3'; Kind='integer'; Min=1; Max=10; Tip='Maximum convergence attempts at each resolution.'}
-        @{Key='crf_rescue_value'; Label='Rescue quality (CRF / CQ)'; Default='28'; Kind='integer'; Min=1; Max=51; Tip='Lower means higher quality. GPU rescue uses the vendor rate-control mode.'}
+        @{Key='crf_rescue_value'; Label='Rescue quality (CRF / CQ)'; Default='28'; Kind='quality'; Min=1; Max=51; Tip='Lower means higher quality and potentially more retries. Choose a suggested value or type an integer from 1 to 51. Quality is not a resolution. AMF/VideoToolbox rescue uses the bitrate budget.'}
         @{Key='hardware_order'; Label='GPU encoder priority'; Default='av1_amf av1_nvenc av1_qsv hevc_amf hevc_nvenc hevc_qsv hevc_videotoolbox h264_nvenc h264_amf h264_qsv h264_videotoolbox'; Kind='hardware'; Tip='Space-separated candidates. First successful test wins. Prefer H.264 for broad playback support.'}
         @{Key='software_order'; Label='Software fallback priority'; Default='libx265 libx264'; Kind='software'; Tip='Space-separated software encoders.'}
         @{Key='no_cleanup'; Label='Keep temporary files and logs'; Default='false'; Kind='bool'; Tip='Preserves the scratch directory for diagnosis.'}
@@ -56,12 +57,12 @@ function Test-Preferences {
         $value = [string]$Values[$item.Key]
         if ($value.Contains("`n") -or $value.Contains("`r")) { throw "Invalid newline in $($item.Label)." }
         switch ($item.Kind) {
-            { $_ -in 'number','integer' } {
+            { $_ -in 'number','integer','quality' } {
                 $number = 0.0
                 if (-not [double]::TryParse($value, [Globalization.NumberStyles]::Float, $inv, [ref]$number) -or
                     [double]::IsNaN($number) -or [double]::IsInfinity($number) -or
                     $number -lt $item.Min -or $number -gt $item.Max -or
-                    ($item.Kind -eq 'integer' -and $number -ne [math]::Floor($number))) {
+                    ($item.Kind -in 'integer','quality' -and $number -ne [math]::Floor($number))) {
                     throw "$($item.Label) must be between $($item.Min) and $($item.Max). Use a dot for decimals."
                 }
             }
@@ -76,6 +77,14 @@ function Test-Preferences {
                 foreach ($name in @($value -split '\s+')) { if ($name -notin 'libx264','libx265') { throw "Invalid software encoder: $name" } }
             }
             'path' { if ([string]::IsNullOrWhiteSpace($value)) { throw 'Choose an output folder.' } }
+            'filename' {
+                $remaining=$value.Replace('{name}','').Replace('{index}','')
+                if ($value -and ($value -match '[<>:"/\\|?*\x00-\x1f]' -or $remaining.Contains('{') -or $remaining.Contains('}') -or
+                    $value -match '[. ]$' -or $value.Length -gt 200 -or
+                    $value -match '^(?i:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)')) {
+                    throw 'Output name must be a filename, with optional {name} and {index} placeholders; no folders or reserved device names.'
+                }
+            }
             'preset' { if ($value -notmatch '^(ultrafast|superfast|veryfast|faster|fast|medium|slow|slower|veryslow|placebo|quality|balanced|speed|p[1-7])$') { throw 'Unsupported preset.' } }
         }
     }
@@ -95,6 +104,61 @@ function Save-Preferences {
 }
 
 function Get-EncoderNames { return $script:EncoderNames }
+
+function Get-EncoderOptions {
+    foreach ($name in $script:EncoderNames) {
+        $description = switch ($name) {
+            'auto' { 'Automatic GPU, then CPU; fast / playback varies' }
+            'hw' { 'Automatic GPU, then CPU; same as auto' }
+            'software' { 'CPU H.265 then H.264; efficient at small sizes / slower' }
+            'software_x264' { 'CPU H.264; broad playback / less efficient than H.265' }
+            'libx264' { 'CPU H.264; broad playback / less efficient than H.265' }
+            'libx265' { 'CPU H.265; efficient compression / slower, playback varies' }
+            default {
+                $vendor = if ($name -like '*_nvenc') { 'NVIDIA GPU' } elseif ($name -like '*_amf') { 'AMD GPU' } elseif ($name -like '*_qsv') { 'Intel GPU' } else { 'macOS hardware' }
+                if ($name -like 'av1_*') { "$vendor AV1; efficient / newer GPU, playback varies" }
+                elseif ($name -like 'hevc_*') { "$vendor H.265; efficient / playback varies" }
+                else { "$vendor H.264; broad playback / larger at equal quality" }
+            }
+        }
+        [pscustomobject]@{Value=$name;Label="$name ($description)"}
+    }
+}
+
+function Get-PresetOptions {
+    foreach ($name in @('slow','medium','fast','ultrafast','superfast','veryfast','faster','slower','veryslow','placebo','quality','balanced','speed','p1','p2','p3','p4','p5','p6','p7')) {
+        $description = switch -Regex ($name) {
+            '^(ultrafast|superfast|veryfast|faster|fast|speed|p[1-3])$' { 'faster / lower compression quality'; break }
+            '^(medium|balanced|p[4-5])$' { 'balanced speed and quality'; break }
+            default { 'better compression quality / slower' }
+        }
+        [pscustomobject]@{Value=$name;Label="$name ($description)"}
+    }
+}
+
+function Get-QualityOptions {
+    @(
+        [pscustomobject]@{Value='18';Label='18 (more detail / harder to fit)'}
+        [pscustomobject]@{Value='23';Label='23 (balanced detail and size)'}
+        [pscustomobject]@{Value='28';Label='28 (smaller / default)'}
+        [pscustomobject]@{Value='32';Label='32 (lower detail / smaller)'}
+        [pscustomobject]@{Value='36';Label='36 (least detail / smallest)'}
+    )
+}
+
+function Get-ControlPreferences {
+    param([System.Collections.IDictionary]$Fields)
+    $values=[ordered]@{}
+    foreach ($item in (Get-SettingsSchema)) {
+        $field=$Fields[$item.Key]
+        $values[$item.Key] = if ($item.Kind -eq 'bool') { $field.Checked.ToString().ToLowerInvariant() }
+            elseif ($item.Kind -eq 'integer') { $field.Value.ToString([Globalization.CultureInfo]::InvariantCulture) }
+            elseif ($item.Kind -in 'encoder','preset','quality' -and $field.SelectedItem -and $field.Text -eq $field.GetItemText($field.SelectedItem)) { $field.SelectedItem.Value }
+            else { $field.Text.Trim() }
+    }
+    Test-Preferences $values
+    return $values
+}
 
 # The events run on .NET threads, never a PowerShell scriptblock without a runspace.
 # The Job object kills descendants when closed, including FFmpeg during cancellation.
@@ -190,4 +254,4 @@ function Close-CompressorWorker {
     }
 }
 
-Export-ModuleMember -Function Get-SettingsSchema,Get-PreferencePath,Read-Preferences,Test-Preferences,Save-Preferences,Get-EncoderNames,Start-CompressorWorker,Close-CompressorWorker
+Export-ModuleMember -Function Get-SettingsSchema,Get-PreferencePath,Read-Preferences,Test-Preferences,Save-Preferences,Get-EncoderNames,Get-EncoderOptions,Get-PresetOptions,Get-QualityOptions,Get-ControlPreferences,Start-CompressorWorker,Close-CompressorWorker

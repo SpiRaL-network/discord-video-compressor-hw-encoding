@@ -30,7 +30,7 @@ function Run-Compression {
     if ($code -ne $ExpectedExit) { Get-Content -LiteralPath $stdout -Tail 50 | ForEach-Object { Write-Host $_ } }
     Assert ($code -eq $ExpectedExit) "Unexpected exit $code for $Name. See $stdout"
     if ($ExpectedExit -eq 0) {
-        $outputs=@(Get-ChildItem -LiteralPath $settings.output_dir -Filter '*_optimized.mp4')
+        $outputs=@(Get-ChildItem -LiteralPath $settings.output_dir -Filter '*.mp4')
         Assert ($outputs.Count -gt 0) "No outputs for $Name"
         foreach ($output in $outputs) {
             Assert ($output.Length -le ([double]$settings.target_size_mb * 1000000)) "Output exceeds exact cap: $output"
@@ -76,25 +76,62 @@ $video=@($info.streams | Where-Object codec_type -eq 'video')[0]
 Assert ($video.width % 2 -eq 0 -and $video.height % 2 -eq 0 -and $video.pix_fmt -eq 'yuv420p') 'Odd dimensions are not encoder-safe.'
 $splitDir=Run-Compression 'split' @($clip) @{target_size_mb='0.45';min_video_bitrate='1000';max_retries='1'}
 Assert (@(Get-ChildItem -LiteralPath $splitDir -Filter '*_PART_*_optimized.mp4').Count -ge 2) 'Split fallback was not exercised.'
+$customSplitDir=Run-Compression 'split-custom' @($clip) @{target_size_mb='0.45';min_video_bitrate='1000';max_retries='1';output_name='Highlights'}
+$parts=@(Get-ChildItem -LiteralPath $customSplitDir -Filter 'Highlights_PART_*.mp4')
+Assert ($parts.Count -ge 2) 'Custom name was not applied to split parts.'
+$partHashes=@{}
+foreach ($part in $parts) { $partHashes[$part.FullName]=(Get-FileHash -LiteralPath $part.FullName).Hash }
+$null=Run-Compression 'split-custom' @($clip) @{target_size_mb='0.45';min_video_bitrate='1000';max_retries='1';output_name='Highlights'}
+Assert (@(Get-ChildItem -LiteralPath $customSplitDir -Filter '*.mp4').Count -eq (2*$parts.Count)) 'Split collisions did not retain both sets of parts.'
+foreach ($part in $partHashes.Keys) { Assert ((Get-FileHash -LiteralPath $part).Hash -eq $partHashes[$part]) 'Existing split part changed.' }
 $bad=Join-Path $Artifacts 'corrupt.mp4'
 [IO.File]::WriteAllText($bad,'not a video')
 $null=Run-Compression 'invalid-input' @($bad) @{} 1
 
-# A second run must refuse to replace a completed video or remove unrelated logs.
+# A second run preserves the old video and creates a numbered output.
 $protected=Join-Path $Artifacts 'x264/clip [one] ! &_optimized.mp4'
 $before=(Get-FileHash -LiteralPath $protected).Hash
 $logFile=Join-Path $Artifacts 'x264/my-important.log'
 [IO.File]::WriteAllText($logFile,'keep me')
-$null=Run-Compression 'x264' @($clip) @{} 1
+$null=Run-Compression 'x264' @($clip) @{target_size_mb='8'}
 Assert ((Get-FileHash -LiteralPath $protected).Hash -eq $before) 'Existing output changed.'
+Assert (Test-Path -LiteralPath (Join-Path $Artifacts 'x264/clip [one] ! & (2)_optimized.mp4')) 'Collision did not create a numbered output.'
 Assert ([IO.File]::ReadAllText($logFile) -eq 'keep me') 'Unrelated log deleted.'
 Assert ((Get-FileHash -LiteralPath $clip).Hash -eq $inputHash) 'Input video changed.'
+$customDir=Run-Compression 'custom-name' @($clip) @{target_size_mb='8';output_name='My Discord clip.mp4';audio_bitrate='127';min_audio_bitrate='124';mono='true'}
+$custom=Join-Path $customDir 'My Discord clip.mp4'
+Assert (Test-Path -LiteralPath $custom) 'Custom output name was ignored.'
+$customHash=(Get-FileHash -LiteralPath $custom).Hash
+$null=Run-Compression 'custom-name' @($clip) @{target_size_mb='8';output_name='My Discord clip.mp4'}
+Assert (Test-Path -LiteralPath (Join-Path $customDir 'My Discord clip (2).mp4')) 'Custom collision was not numbered.'
+Assert ((Get-FileHash -LiteralPath $custom).Hash -eq $customHash) 'Custom output was replaced.'
+$a=Join-Path $Artifacts 'source-a'; $b=Join-Path $Artifacts 'source-b'
+New-Item -ItemType Directory -Path $a,$b | Out-Null
+Copy-Item -LiteralPath $clip -Destination (Join-Path $a 'shared.mp4')
+Copy-Item -LiteralPath $clip -Destination (Join-Path $b 'shared.mp4')
+$duplicateDir=Run-Compression 'duplicate-names' @((Join-Path $a 'shared.mp4'),(Join-Path $b 'shared.mp4')) @{target_size_mb='8'}
+Assert (Test-Path -LiteralPath (Join-Path $duplicateDir 'shared (2)_optimized.mp4')) 'Duplicate source basename was not disambiguated.'
+$templateDir=Run-Compression 'template' @((Join-Path $a 'shared.mp4'),(Join-Path $b 'shared.mp4')) @{target_size_mb='8';output_name='Discord {name} {index}'}
+Assert ((Test-Path -LiteralPath (Join-Path $templateDir 'Discord shared 001.mp4')) -and (Test-Path -LiteralPath (Join-Path $templateDir 'Discord shared 002.mp4'))) 'Batch output template failed.'
+$literalDir=Run-Compression 'template-literal' @($clip) @{target_size_mb='8';output_name='Discord {name} {index}'}
+Assert (Test-Path -LiteralPath (Join-Path $literalDir 'Discord clip [one] ! & 001.mp4')) 'Template changed literal source characters.'
+$batchDir=Run-Compression 'constant-batch' @((Join-Path $a 'shared.mp4'),(Join-Path $b 'shared.mp4')) @{target_size_mb='8';output_name='Highlights'}
+Assert ((Test-Path -LiteralPath (Join-Path $batchDir 'Highlights_001.mp4')) -and (Test-Path -LiteralPath (Join-Path $batchDir 'Highlights_002.mp4'))) 'Constant batch name failed.'
+$folderOutput=Join-Path $a 'results'
+$null=Run-Compression 'folder-output' @($a) @{target_size_mb='8';output_dir=$folderOutput;output_name='Custom'}
+$null=Run-Compression 'folder-output' @($a) @{target_size_mb='8';output_dir=$folderOutput;output_name='Custom'}
+Assert (@(Get-ChildItem -LiteralPath $folderOutput -Filter '*.mp4').Count -eq 2) 'Folder scan reprocessed custom outputs.'
 
 $defaults=Read-Preferences ''
 $defaults.target_size_mb='NaN'
 $rejected=$false
 try { Test-Preferences $defaults } catch { $rejected=$true }
 Assert $rejected 'NaN target accepted.'
+$defaults=Read-Preferences ''
+$defaults.output_name='../outside'
+$rejected=$false
+try { Test-Preferences $defaults } catch { $rejected=$true }
+Assert $rejected 'Output name accepted a directory traversal.'
 $defaults=Read-Preferences ''
 $prefs=Join-Path $Artifacts 'roundtrip.conf'
 Save-Preferences $prefs $defaults
@@ -108,6 +145,21 @@ $form.Show(); $form.PerformLayout(); [Windows.Forms.Application]::DoEvents()
 $bitmap=New-Object Drawing.Bitmap($form.Width,$form.Height)
 $form.DrawToBitmap($bitmap,(New-Object Drawing.Rectangle(0,0,$form.Width,$form.Height)))
 $bitmap.Save((Join-Path $Artifacts 'gui.png')); $bitmap.Dispose(); $form.Dispose()
+
+# Dropdown explanations are presentation text; saved values remain encoder/preset IDs.
+$form=& (Join-Path $root 'compressor-gui.ps1') -TestMode
+$fields=$form.Tag
+$fields.mode.SelectedItem=@($fields.mode.Items | Where-Object Value -eq 'h264_nvenc')[0]
+$fields.preset.SelectedItem=@($fields.preset.Items | Where-Object Value -eq 'fast')[0]
+$fields.audio_bitrate.Value=127; $fields.min_audio_bitrate.Value=124
+$fields.output_name.Text='New clip'
+$fields.crf_rescue_value.SelectedIndex=-1
+$fields.crf_rescue_value.Text='27'
+$fromUi=Get-ControlPreferences $fields
+Assert ($fromUi.mode -eq 'h264_nvenc' -and $fromUi.preset -eq 'fast') 'Explanation labels leaked into encoder arguments.'
+Assert ($fromUi.audio_bitrate -eq '127' -and $fromUi.min_audio_bitrate -eq '124' -and $fromUi.crf_rescue_value -eq '27') 'Custom numeric settings were not preserved.'
+Assert ($fields.mode.GetItemText($fields.mode.SelectedItem) -match 'NVIDIA.*broad playback') 'Encoder advantages are missing from the dropdown.'
+$form.Dispose()
 
 # Exercise the actual GUI worker: JSON file paths, log streaming, and Job supervision.
 $defaults.output_dir=Join-Path $Artifacts 'gui-worker'

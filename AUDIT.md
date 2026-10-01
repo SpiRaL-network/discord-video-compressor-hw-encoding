@@ -10,7 +10,8 @@ download, cleanup and splitting paths. It is not a formal security certification
 - Exact decimal-byte cap instead of a rounded-up whole-megabyte threshold. Remuxed
   copies are checked again; failed/empty rescue encodes are not accepted.
 - Per-invocation scratch directories replace broad filename-pattern cleanup in user output folders.
-- Existing outputs and duplicate source basenames are rejected; inputs are read-only.
+- Existing outputs are preserved through automatic numbering, including duplicate source
+  basenames and split parts. Custom filenames and batch templates are validated; inputs are read-only.
 - Windows filesystem operations and logging handle literal paths with spaces, brackets, `!` and `&`.
 - Corrupt/audio-only input is rejected before the copy path. Mono and normalization are
   honored on small clips; failed audio stripping falls through to encoding.
@@ -36,12 +37,16 @@ It checks parser compatibility, x264/x265, automatic GPU/software selection, exp
 NVENC selection with fallback, exact byte limits, audio controls on small clips, MKV
 remuxing, recursive splitting, corrupt input, protected outputs and source hashes,
 preference round-trip/rejection, offscreen GUI construction and the actual GUI worker.
+Custom output names, repeated runs, duplicate names and batch templates are tested.
+GUI tests verify that explanatory menu labels do not leak into FFmpeg arguments,
+and that custom integer audio bitrates and rescue quality survive form serialization.
 Cancellation checks that observed FFmpeg child processes exit with the worker.
 An injected runtime GPU failure also verifies that the retry creates a real software-encoded H.264 file.
 
 `tests/linux.sh` uses the same generated-clip approach for the Bash backend. It checks
 software and auto encoding, exact caps, audio controls, remuxing, splitting, corrupt
-input, invalid settings and output/log protection. GitHub Actions runs both suites.
+input, invalid settings, custom names, batch templates and output/log protection.
+GitHub Actions runs both suites.
 
 Local testing also exercises actual NVIDIA **AV1 NVENC, HEVC NVENC and H.264 NVENC**.
 No AMD AMF, Intel QSV, Apple VideoToolbox or macOS device is available for a real local

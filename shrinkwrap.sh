@@ -30,7 +30,7 @@ CONFIG_TARGET_SIZE_MB=""; CONFIG_PRESET=""
 CONFIG_NORMALIZE_AUDIO=""; CONFIG_MONO=""; CONFIG_NO_AUDIO=""
 CONFIG_AUDIO_BITRATE=""; CONFIG_MIN_AUDIO_BITRATE=""
 CONFIG_MIN_VIDEO_BITRATE=""; CONFIG_MAX_RETRIES=""
-CONFIG_CRF_RESCUE_VALUE=""; CONFIG_OUTPUT_DIR=""; CONFIG_NO_CLEANUP=""
+CONFIG_OUTPUT_NAME=""; CONFIG_CRF_RESCUE_VALUE=""; CONFIG_OUTPUT_DIR=""; CONFIG_NO_CLEANUP=""
 
 trim() { # echo $1 with leading/trailing whitespace removed (pure bash, no subprocess)
     local s="$1"
@@ -95,6 +95,7 @@ read_config() { # parse the conf at $1 into the CONFIG_* globals (no-op when abs
             max_retries)       CONFIG_MAX_RETRIES="$value" ;;
             crf_rescue_value)  CONFIG_CRF_RESCUE_VALUE="$value" ;;
             output_dir)        CONFIG_OUTPUT_DIR="$value" ;;
+            output_name)       CONFIG_OUTPUT_NAME="$value" ;;
             no_cleanup)        CONFIG_NO_CLEANUP="$value" ;;
         esac
     done < "$path"
@@ -157,6 +158,7 @@ min_audio_bitrate = $min_aud
 # crf_rescue_value: CRF quality value for Phase 3 rescue pass (default: 28)
 # no_cleanup: preserve logs and intermediate pass files (true/false, default: false)
 output_dir = $out_dir
+output_name = ${CONFIG_OUTPUT_NAME:-}
 min_video_bitrate = $min_vid
 max_retries = $max_ret
 crf_rescue_value = $crf_val
@@ -215,6 +217,7 @@ usage() {
     echo "  -a <kbps>       Minimum audio bitrate floor (default: 64)"
     echo "  -r <retries>    Max encoding retries per pass (default: 3)"
     echo "  -o <dir>        Output directory (default: optimized)"
+    echo "  -N <name>       Output name or template ({name}, {index}); empty uses source_optimized"
     echo "  -n              No cleanup - preserve logs/artifacts for debugging"
     echo "  -l              Normalize audio loudness (EBU R128 / -16 LUFS, two-pass)"
     echo "  -m              Downmix audio to mono (frees budget on voice-only clips)"
@@ -257,6 +260,7 @@ normalize_audio="$([ "${CONFIG_NORMALIZE_AUDIO:-}" = "true" ] && echo 1 || echo 
 audio_channels="$([ "${CONFIG_MONO:-}" = "true" ] && echo 1 || echo 2)"
 remove_audio="$([ "${CONFIG_NO_AUDIO:-}" = "true" ] && echo 1 || echo 0)"
 OUTPUT_DIR="${CONFIG_OUTPUT_DIR:-optimized}"
+OUTPUT_NAME="${CONFIG_OUTPUT_NAME:-}"
 INITIAL_AUDIO_BITRATE_KBPS="${CONFIG_AUDIO_BITRATE:-192}"
 CRF_RESCUE_VALUE="${CONFIG_CRF_RESCUE_VALUE:-28}"
 
@@ -273,7 +277,7 @@ for arg in "$@"; do
 done
 set -- "${pruned_args[@]}"
 
-while getopts "c:p:t:v:a:r:o:nhlmA" opt; do
+while getopts "c:p:t:v:a:r:o:N:nhlmA" opt; do
     case $opt in
         c) encoder_choice="$OPTARG"; encoder_explicit=1 ;;
         p) preset="$OPTARG" ;;
@@ -282,6 +286,7 @@ while getopts "c:p:t:v:a:r:o:nhlmA" opt; do
         a) min_audio_bitrate_kbps="$OPTARG" ;;
         r) max_retries="$OPTARG" ;;
         o) OUTPUT_DIR="$OPTARG" ;;
+        N) OUTPUT_NAME="$OPTARG" ;;
         n) cleanup=0 ;; # Debug mode enabled
         l) normalize_audio=1 ;; # Enable audio normalization
         m) audio_channels=1 ;; # Downmix audio to mono
@@ -895,12 +900,26 @@ record_summary() { # Append one delimited record to the session report.
     REPORT_RECORDS+=("${file}${REPORT_SEP}${orig_size}${REPORT_SEP}${final_size}${REPORT_SEP}${reduction}${REPORT_SEP}${status}")
 }
 
+output_path() { # Keep source names independent from custom output names.
+    local suffix="${1:-}" stem="$OUTPUT_STEM" number=2 candidate
+    if [ -n "$suffix" ]; then
+        if [[ "$stem" = *_optimized ]]; then stem="${stem%_optimized}${suffix}_optimized"; else stem="${stem}${suffix}"; fi
+    fi
+    candidate="$stem"
+    while [ -e "$FINAL_OUTPUT_DIR/$candidate.mp4" ] || { [ -n "$suffix" ] && [[ "${RESERVED_OUTPUTS[$candidate]:-}" = 1 ]]; }; do
+        if [[ "$stem" = *_optimized ]]; then candidate="${stem%_optimized} ($number)_optimized"; else candidate="$stem ($number)"; fi
+        number=$((number + 1))
+    done
+    printf '%s' "$FINAL_OUTPUT_DIR/$candidate.mp4"
+}
+
 rescue_video() { # Fallback Strategy: Downscale to 720p to maintain bitrate density.
     local input_file="$1"
     local part_suffix="${2:-}"
     local orig_size_mb="$3"
     local filename="$BASE_NAME"
-    local output_file="${FINAL_OUTPUT_DIR}/${filename}${part_suffix}_optimized.mp4"
+    local output_file
+    output_file=$(output_path "$part_suffix")
     local temp_file="${OUTPUT_DIR}/${filename}${part_suffix}_temp_$$_${RANDOM}.mp4"
     local passlog="${OUTPUT_DIR}/rescue_pass_$$_${RANDOM}"
     
@@ -1154,7 +1173,8 @@ split_video() { # Temporal Segmentation: Split video at nearest keyframe.
 optimize_video() { # Primary Optimization Pipeline: 2-Pass HEVC Encoding.
     local input_file="$1" part_suffix="${2:-}"
     local filename="$BASE_NAME"
-    local output_file="${FINAL_OUTPUT_DIR}/${filename}${part_suffix}_optimized.mp4"
+    local output_file
+    output_file=$(output_path "$part_suffix")
     local temp_file="${OUTPUT_DIR}/${filename}${part_suffix}_temp_$$_${RANDOM}.mp4"
     local passlog="${OUTPUT_DIR}/ffmpeg2pass_$$_${RANDOM}"
     mkdir -p "$OUTPUT_DIR"
@@ -1428,14 +1448,37 @@ done
 
 mkdir -p "$OUTPUT_DIR" || exit 1
 FINAL_OUTPUT_DIR=$(cd "$OUTPUT_DIR" && pwd)
-seen_names=()
+declare -A RESERVED_OUTPUTS=()
+declare -a output_stems=()
+template_remaining="${OUTPUT_NAME//\{name\}/}"
+template_remaining="${template_remaining//\{index\}/}"
+if [[ "$template_remaining" = *'{'* || "$template_remaining" = *'}'* ]]; then bail_out 'Only {name} and {index} output placeholders are supported.'; fi
+plan_index=0
 for file in "${to_process[@]}"; do
-    name=$(basename_noext "$file")
-    [ -e "$FINAL_OUTPUT_DIR/${name}_optimized.mp4" ] && bail_out "Output exists for $name; choose an empty output folder."
-    for seen in "${seen_names[@]}"; do
-        [ "$seen" = "$name" ] && bail_out "Duplicate input name: $name; rename inputs."
+    plan_index=$((plan_index + 1))
+    source_name=$(basename_noext "$file")
+    if [ -z "$OUTPUT_NAME" ]; then
+        stem="${source_name}_optimized"
+    else
+        stem="$OUTPUT_NAME"
+        [[ "$stem" =~ \.[mM][pP]4$ ]] && stem="${stem%.*}"
+        has_placeholder=0
+        [[ "$stem" == *'{name}'* || "$stem" == *'{index}'* ]] && has_placeholder=1
+        index_token=$(printf '%03d' "$plan_index")
+        stem="${stem//\{index\}/$index_token}"
+        stem="${stem//\{name\}/"$source_name"}"
+        if [ "${#to_process[@]}" -gt 1 ] && [ "$has_placeholder" -eq 0 ]; then stem="${stem}_$index_token"; fi
+    fi
+    if [ -z "$stem" ] || [[ "$stem" =~ [\<\>\:\"/\\\|\?\*] || "$stem" == *$'\n'* || "$stem" == *$'\r'* || "$stem" == *'.' || "$stem" == *' ' ]] ||
+        [ "${#stem}" -gt 200 ]; then bail_out "Invalid output name: $stem"; fi
+    candidate="$stem"
+    number=2
+    while [ -e "$FINAL_OUTPUT_DIR/$candidate.mp4" ] || [[ "${RESERVED_OUTPUTS[$candidate]:-}" = 1 ]]; do
+        if [[ "$stem" = *_optimized ]]; then candidate="${stem%_optimized} ($number)_optimized"; else candidate="$stem ($number)"; fi
+        number=$((number + 1))
     done
-    seen_names+=("$name")
+    RESERVED_OUTPUTS[$candidate]=1
+    output_stems+=("$candidate")
 done
 OUTPUT_DIR=$(mktemp -d "$FINAL_OUTPUT_DIR/.shrinkwrap-XXXXXXXX") || exit 1
 SUMMARY_FILE="$FINAL_OUTPUT_DIR/optimization_summary.txt"
@@ -1449,6 +1492,8 @@ for file in "${to_process[@]}"; do
     fsize=$(get_file_size_mb "$file" 2>/dev/null) || fsize=0
     total_in_mb=$(echo "$total_in_mb + $fsize" | bc -l)
     BASE_NAME=$(basename_noext "$file")
+    OUTPUT_STEM="${output_stems[$((idx - 1))]}"
+    echo "Output: $FINAL_OUTPUT_DIR/$OUTPUT_STEM.mp4"
     optimize_video "$file" || failures=$((failures + 1))
 done
 
